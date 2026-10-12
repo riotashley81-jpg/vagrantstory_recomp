@@ -1,0 +1,228 @@
+From b174e2835ce5bc7a36d6ef6aab9ffe5c3940c913 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 10 Oct 2026 15:25:21 +0200
+Subject: [PATCH 01/13] Local patches: MSVC build fixes and a bottom prompt-bar
+ OSD slot
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/host_osd.h    |  8 ++++++
+ runtime/runtime.cmake         |  6 +++--
+ runtime/src/gpu_gl_renderer.c | 46 ++++++++++++++++++++++++++++-------
+ runtime/src/host_osd.c        | 10 ++++++++
+ runtime/src/main.cpp          |  2 ++
+ 5 files changed, 61 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/include/host_osd.h b/runtime/include/host_osd.h
+index e4e6f307..9c7f1af2 100644
+--- a/runtime/include/host_osd.h
++++ b/runtime/include/host_osd.h
+@@ -40,6 +40,14 @@ int host_osd_image(const uint32_t **pixels, int *w, int *h);          /* text */
+ int host_osd_volume_image(const uint32_t **pixels, int *w, int *h);   /* bar */
+ void host_osd_present_done(void);
+ 
++/* Bottom-centre prompt bar (local patch for game-owned button prompts). The
++ * provider runs on the emulation thread when overlays are gathered for a
++ * present and returns 1 with an ARGB8888 image, or 0 to draw nothing. The
++ * pixels must stay valid until the provider is called again. */
++typedef int (*HostOsdPromptProvider)(const uint32_t **pixels, int *w, int *h);
++void host_osd_set_prompt_provider(HostOsdPromptProvider provider);
++int  host_osd_prompt_image(const uint32_t **pixels, int *w, int *h);
++
+ /* Software / SDL_Renderer path: draw overlays over the current backbuffer. */
+ struct SDL_Renderer;
+ void host_osd_draw_sdl(struct SDL_Renderer *renderer);
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index aa30edcf..90828572 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -2480,8 +2480,10 @@ function(psxrecomp_add_runtime_target target)
+         # Visual Studio project files cannot represent language-specific target
+         # options on a mixed C/C++ target. Scope the experimental MSVC atomics
+         # switch to the one C source that needs it instead.
+-        set_property(SOURCE ${PSXRECOMP_ROOT}/runtime/src/audio_trace.c
+-            APPEND PROPERTY COMPILE_OPTIONS /experimental:c11atomics)
++        # Local patch: several runtime C sources (not just audio_trace.c)
++        # include <stdatomic.h>, so enable MSVC's C11 atomics for all C.
++        target_compile_options(${target} PRIVATE
++            $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
+         # No console window in Release MSVC builds. /ENTRY keeps main() as
+         # the entry point (not WinMain) while switching to the Windows subsystem.
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index d05df396..3c8dd501 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3226,6 +3226,16 @@ int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+  * flip between any two primitives. Like their neighbours the setters sync
+  * with a live render thread first (GL_RT_SYNC), so a change never lands in
+  * the middle of a replayed frame; they are safe at session_reboot. */
++#ifdef _MSC_VER /* local patch: MSVC has no GCC __atomic builtins */
++#include <stdatomic.h>
++static _Atomic int s_pgxp_render_wanted = 0;
++static void pgxp_render_wanted_update(void) {
++    atomic_store_explicit(&s_pgxp_render_wanted, (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam) ? 1 : 0, memory_order_release);
++}
++int gl_renderer_pgxp_render_wanted(void) {
++    return atomic_load_explicit(&s_pgxp_render_wanted, memory_order_acquire);
++}
++#else
+ static int s_pgxp_render_wanted = 0;   /* any PGXP renderer feature on */
+ static void pgxp_render_wanted_update(void) {
+     __atomic_store_n(&s_pgxp_render_wanted, (s_pgxp_depth || s_pgxp_cpersp || s_pgxp_seam) ? 1 : 0, __ATOMIC_RELEASE);
+@@ -3233,6 +3243,7 @@ static void pgxp_render_wanted_update(void) {
+ int gl_renderer_pgxp_render_wanted(void) {
+     return __atomic_load_n(&s_pgxp_render_wanted, __ATOMIC_ACQUIRE);
+ }
++#endif
+ void gl_renderer_set_pgxp_depth(int on) {
+     GL_RT_SYNC("set_pgxp_depth");
+     s_pgxp_depth = on ? 1 : 0;
+@@ -8866,6 +8877,7 @@ static void pass_apply_promotion(void) {
+ /* Draw one host OSD ARGB image into the default framebuffer at (vx,vy)
+  * in top-left window coordinates (y down). Bitmap is ow×oh; viewport is
+  * dw×dh (may upscale for HiDPI / large windows). */
++static int s_osd_alpha_blend = 0;   /* local patch: set around the prompt bar */
+ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+                               int dw, int dh, int vx, int vy, int ww, int wh) {
+     if (!px || ow <= 0 || oh <= 0 || dw <= 0 || dh <= 0 ||
+@@ -8899,6 +8911,10 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+     glDisable(GL_BLEND);
+     if (p_glBlendEquationSeparate)
+         p_glBlendEquationSeparate(PSXGL_FUNC_ADD, PSXGL_FUNC_ADD);
++    if (s_osd_alpha_blend) {   /* local patch: translucent prompt bar */
++        glEnable(GL_BLEND);
++        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++    }
+     /* GL viewport origin is bottom-left. */
+     glViewport(vx, wh - vy - dh, dw, dh);
+     p_glUseProgram(s_present_prog);
+@@ -8916,6 +8932,7 @@ static void gl_draw_osd_image(const uint32_t *px, int ow, int oh,
+         p_glBindVertexArray(0);
+     }
+     p_glUseProgram(0);
++    if (s_osd_alpha_blend) glDisable(GL_BLEND);
+ }
+ 
+ /* Composite host toast + volume bar into the default framebuffer, then swap. */
+@@ -9009,8 +9026,8 @@ static void present_image_ring_capture_gl(void) {
+  * at record time; replay draws that copy (ov_* below), never the live ones. */
+ static struct {
+     int valid, needs_present;
+-    const uint32_t *px[4];
+-    int w[4], h[4];
++    const uint32_t *px[5];
++    int w[5], h[5];
+     float slide;
+ } s_rth_ov;
+ static int ov_image(int i, const uint32_t **px, int *w, int *h) {
+@@ -9022,6 +9039,7 @@ static int ov_image(int i, const uint32_t **px, int *w, int *h) {
+     case 0: return host_osd_image(px, w, h);
+     case 1: return host_osd_volume_image(px, w, h);
+     case 2: return psx_rewind_overlay_image(px, w, h);
++    case 4: return host_osd_prompt_image(px, w, h);   /* local patch */
+     default: return psx_savestate_menu_overlay_image(px, w, h);
+     }
+ }
+@@ -9298,6 +9316,16 @@ static void gl_swap_with_osd(void) {
+                 vy = wh - (int)((float)dh * slide + 0.5f);
+                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
+             }
++            /* Local patch: bottom-centre prompt bar, drawn under the
++             * savestate menu so a full-screen menu still covers it. */
++            if (ov_image(4, &px, &ow, &oh) && px) {
++                const int dw = ow * ui, dh = oh * ui;
++                const int bx = (ww > dw) ? (ww - dw) / 2 : 0;
++                const int by = (wh > dh + margin) ? (wh - dh - margin) : 0;
++                s_osd_alpha_blend = 1;
++                gl_draw_osd_image(px, ow, oh, dw, dh, bx, by, ww, wh);
++                s_osd_alpha_blend = 0;
++            }
+             if (ov_image(3, &px, &ow, &oh) && px)
+                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+         }
+@@ -10632,18 +10660,18 @@ static int rth_record_mode(void) {
+ 
+ /* Present records carry the host overlays the emulation thread rasterized. */
+ typedef struct RthOvHdr {
+-    int32_t needs_present, has, w[4], h[4];
++    int32_t needs_present, has, w[5], h[5];
+     float   slide;
+     int32_t args[8], nargs;
+ } RthOvHdr;
+ 
+ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
+-    const uint32_t *px[4] = { NULL, NULL, NULL, NULL };
+-    int w[4] = { 0 }, h[4] = { 0 };
++    const uint32_t *px[5] = { NULL, NULL, NULL, NULL, NULL };
++    int w[5] = { 0 }, h[5] = { 0 };
+     RthOvHdr hd;
+     memset(&hd, 0, sizeof hd);
+     hd.needs_present = host_osd_needs_present();
+-    for (int i = 0; i < 4; i++) {
++    for (int i = 0; i < 5; i++) {
+         if (ov_image(i, &px[i], &w[i], &h[i]) && px[i] && w[i] > 0 && h[i] > 0) {
+             hd.has |= 1 << i; hd.w[i] = w[i]; hd.h[i] = h[i];
+         }
+@@ -10652,13 +10680,13 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
+     hd.nargs = n;
+     for (int i = 0; i < n && i < 8; i++) hd.args[i] = v[i];
+     size_t bytes = sizeof hd;
+-    for (int i = 0; i < 4; i++)
++    for (int i = 0; i < 5; i++)
+         if (hd.has & (1 << i)) bytes += (size_t)hd.w[i] * hd.h[i] * 4u;
+     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
+     if (!p) return 0;
+     memcpy(p, &hd, sizeof hd);
+     uint8_t *q = p + sizeof hd;
+-    for (int i = 0; i < 4; i++)
++    for (int i = 0; i < 5; i++)
+         if (hd.has & (1 << i)) {
+             size_t n4 = (size_t)hd.w[i] * hd.h[i] * 4u;
+             memcpy(q, px[i], n4);
+@@ -10702,7 +10730,7 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
+     s_rth_ov.valid = 1;
+     s_rth_ov.needs_present = hd.needs_present;
+     s_rth_ov.slide = hd.slide;
+-    for (int i = 0; i < 4; i++)
++    for (int i = 0; i < 5; i++)
+         if (hd.has & (1 << i)) {
+             s_rth_ov.px[i] = (const uint32_t *)q;
+             s_rth_ov.w[i] = hd.w[i];
+diff --git a/runtime/src/host_osd.c b/runtime/src/host_osd.c
+index 62c387d0..29a884bb 100644
+--- a/runtime/src/host_osd.c
++++ b/runtime/src/host_osd.c
+@@ -517,3 +517,13 @@ void host_osd_draw_sdl(struct SDL_Renderer *renderer) {
+     (void)renderer;
+ #endif /* PSX_SDL_NO_RENDER */
+ }
++
++/* Local patch: game-owned bottom prompt bar (see host_osd.h). */
++static HostOsdPromptProvider s_prompt_provider = NULL;
++void host_osd_set_prompt_provider(HostOsdPromptProvider provider) {
++    s_prompt_provider = provider;
++}
++int host_osd_prompt_image(const uint32_t **pixels, int *w, int *h) {
++    if (!HOST_OSD_VISUAL || !s_prompt_provider) return 0;
++    return s_prompt_provider(pixels, w, h);
++}
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index e74a632f..278ea86a 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -18147,9 +18147,11 @@ int main(int argc, char** argv) {
+         /* The helper restores interpolation and Skip FMVs to their
+          * pre-activation values, which is only right while no launcher
+          * control owns them. */
++#ifndef _MSC_VER /* local patch: MSVC rejects this constant read here */
+         static_assert(!frame_interpolation_offered && !skip_fmv_offered,
+                       "reset_mod_owned_presentation() would clobber a launcher "
+                       "setting; restore only when the feature is mod-owned");
++#endif
+         reset_mod_owned_presentation();
+         /* Netplay own-view mods: the widescreen margin follows them into the
+          * sandboxed own view only; the shared game keeps the stock cull. */
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,32 @@
+From 3a0870e403e8707a0a719f8a89e8230416b3a630 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 22:44:58 +0200
+Subject: [PATCH 17/17] GL: keep framebuffer feedback on across the sprite's
+ split batches
+
+A batch flush between a sprite's two triangles turned u_fb off after the
+first one, so half of each fade sprite still read the packed 1x copy.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 0ed8c192..b8c9033c 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -4163,6 +4163,10 @@ static void flush_tex_batch_impl(void) {
+         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+         gl_perf_mirror_end();
+     }
++    if (s_fbfb_live && !s_hiw) {   /* the sprite's other triangle may follow in its own batch */
++        p_glUseProgram(s_tex_prog);
++        p_glUniform1i(s_uFb, 1);
++    }
+     hr_end();
+     if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
+ }
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,71 @@
+From becc96bedc0f179709f7d4f24631fbb1430c2cf0 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 01:17:02 +0200
+Subject: [PATCH 08/13] Native-wide aux layer: keep its margin geometry past
+ the fast reject
+
+The draw-area fast reject only widened X for display buffers, so polygons
+lying wholly in the aux layer's margins were dropped before the mirror.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index f67660bc..fd68480b 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -223,6 +223,8 @@ static uint32_t ws_ui_rankdrop_count;
+ static int      ws_mode    = 0;
+ static int      ws_cfg_num = 4, ws_cfg_den = 3;
+ static void ws_nw_sync_target(void);
++static int ws_aux_x = -1, ws_aux_y = 0;   /* native-wide aux target (local patch) */
++static int ws_aux_draw_target(void);
+ 
+ #define WS_TAG_BUCKETS 4096                  /* power of two */
+ #define WS_TAG_PROBES  8
+@@ -3621,8 +3623,6 @@ void gpu_vertical_split_debug(int *active, int *left_age, int *right_age) {
+ /* Point the renderer's wide mirror at the current back buffer (draw_area_left)
+  * when native-wide is active and that buffer is a known display buffer; else
+  * disable mirroring for this draw. Called when the draw env changes. */
+-static int ws_aux_x = -1, ws_aux_y = 0;
+-void gpu_ws_set_aux_target(int x, int y) { ws_aux_x = x; ws_aux_y = y; }
+ 
+ static void ws_nw_sync_target(void) {
+     if (!ws_native_wide_active()) {
+@@ -3630,8 +3630,7 @@ static void ws_nw_sync_target(void) {
+         gr_wide_disable_target(); return;
+     }
+     gr_wide_configure(ws_nw_present_width(), ws_nw_offset());
+-    if (ws_aux_x >= 0 && (int)draw_area_left == ws_aux_x &&
+-        (int)draw_area_top == ws_aux_y) {   /* offscreen layer with margins */
++    if (ws_aux_draw_target()) {   /* offscreen layer with margins */
+         gr_wide_set_target(ws_aux_x);
+         return;
+     }
+@@ -4809,11 +4808,21 @@ static void raster_pixel(int32_t x, int32_t y, uint16_t color) {
+  * and contributed the original generalized fix in psxrecomp PR #73:
+  * https://github.com/mstan/psxrecomp/pull/73
+  * Keep that credit with this guarded framebuffer-target variant. */
++/* Native-wide auxiliary target (local patch, gpu_ws_set_aux_target): draws
++ * whose draw area starts at (ws_aux_x, ws_aux_y) get a wide surface of their
++ * own, and reach its margins like a display buffer's. */
++void gpu_ws_set_aux_target(int x, int y) { ws_aux_x = x; ws_aux_y = y; }
++static int ws_aux_draw_target(void) {
++    return ws_aux_x >= 0 && (int)draw_area_left == ws_aux_x &&
++           (int)draw_area_top == ws_aux_y;
++}
++
+ static inline int32_t draw_area_wide_x_margin(void) {
+     int local_base = 0;
+     if (!ws_native_wide_active()) return 0;
+     if (ws_local_viewport_draw_target(&local_base)) return (int32_t)ws_nw_offset();
+     if (ws_display_viewport_draw_target(NULL)) return (int32_t)ws_nw_offset();
++    if (ws_aux_draw_target()) return (int32_t)ws_nw_offset();   /* local patch */
+     if (!ws_is_fb_base(draw_area_left)) return 0;
+     return (int32_t)ws_nw_offset();
+ }
+-- 
+2.54.0.windows.1
+

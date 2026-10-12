@@ -1,0 +1,170 @@
+From d975664ed3158005a8d06062ed417f4e5aa33fd1 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 01:02:15 +0200
+Subject: [PATCH 07/13] Native-wide aux layer: seamless blur edges, Smooth
+ motion
+
+The 4:3 frame omits the blur's seam tiles at its two edges; draw the
+shifted copies into the canonical frame as well so those columns match
+the margins (they read as a dark line). Sample the layer's margins with
+the canonical pack's quantization, keep the margins live across
+generated frames, and let wide_full dump the whole surface.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/debug_server.c    |  6 ++++-
+ runtime/src/gpu_gl_renderer.c | 50 ++++++++++++++++++++++++++++++-----
+ 2 files changed, 49 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 391248c4..7d6d6b16 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -10762,7 +10762,11 @@ static void handle_wide_full(int id, const char *json)
+         strncpy(path, "psx_wide_full.png", sizeof(path) - 1);
+     path[sizeof(path) - 1] = '\0';
+ 
+-    int cap = 1024 * 1024 * 4;  /* up to 4 Mpix (e.g. 426*512*S^2) */
++    /* The whole surface: wide_w*S x 512*S (the lower band starts at row 256*S). */
++    int S = gr_scale();
++    if (S < 1) S = 1;
++    long long need = (long long)ws_nw_present_width() * S * 512LL * S;
++    int cap = need > 1024LL * 1024 * 4 && need < (1LL << 28) ? (int)need : 1024 * 1024 * 4;
+     uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
+     if (!buf) { send_err(id, "alloc failed"); return; }
+     int W = 0, H = 0;
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 7daadfde..1347d745 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -941,8 +941,10 @@ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
+ /* Native-wide auxiliary target (local patch, gl_renderer_set_wide_aux): a
+  * display-sized offscreen layer [s_aux_x, + native width) x [s_aux_y0, s_aux_y1)
+  * with a wide surface of its own. s_aux_age counts presents since it was last
+- * a draw target; its margins are only read while that is recent. */
++ * a draw target; its margins are only read while that is recent (Smooth
++ * motion presents in-between frames too, so allow a few dozen). */
+ static int    s_aux_x = -1, s_aux_y0 = 0, s_aux_y1 = 0, s_aux_age = 1000;
++static int    s_aux_queued = 0;   /* the mirror queue holds draws into it */
+ /* Set by gpu_flat_rect for the full-screen-overlay case so the generic
+  * gpu_geometry wide mirror is skipped and the flat path emits its own
+  * full-wide-width pass instead (mirrors sw_draw_flat_rect). */
+@@ -2038,7 +2040,7 @@ static const char *TEX_FS =
+     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+     "  vec2 dx=dFdx(uv), dy=dFdy(uv);\n"
+     "  vec2 uv0=uv, dx0=dx, dy0=dy;   /* the PS1 sample point (texture_lod) */\n"
+-    "  if (u_aux != 0) {\n"
++    "  if (u_aux == 1) {\n"
+     "    if (v_depth != 2 || v_hd_mode != 0 ||\n"
+     "        v_tpage.x < u_aux_rect.x || v_tpage.x >= u_aux_rect.z) discard;\n"
+     "    int ax = v_tpage.x + int(floor(uv.x)) + u_aux_shift;\n"
+@@ -2050,8 +2052,8 @@ static const char *TEX_FS =
+     "      int lx = ax - u_aux_rect.x + u_aux_geom.x;\n"
+     "      if (lx < 0 || lx >= u_aux_geom.y) discard;\n"
+     "      vec4 a = texelFetch(u_aux_tex, ivec2(lx, ay) * u_aux_geom.z, 0);\n"
+-    "      ivec3 c5 = ivec3(floor(a.rgb * 31.0 + 0.5));\n"
+-    "      raw = c5.r | (c5.g << 5) | (c5.b << 10) | (a.a > 0.5 ? 0x8000 : 0);\n"
++    "      ivec3 c5 = ivec3(a.rgb * 255.0 + 0.5) >> 3;   /* as PACK_FS */\n"
++    "      raw = c5.r | (c5.g << 5) | (c5.b << 10) | (a.a >= 0.5 ? 0x8000 : 0);\n"
+     "    }\n"
+     "    if (raw == 0) discard;\n"
+     "    rgb = col5(raw);\n"
+@@ -3629,7 +3631,7 @@ static int mirror_batch_center_only(int nverts) {
+  * the tile pattern continues; texels left or right of the layer's canonical
+  * columns come from its wide surface. */
+ static int aux_batch_live(int nverts) {
+-    if (s_aux_x < 0 || s_aux_age > 4 || !g_wide_cur || g_wide_cur_base == s_aux_x ||
++    if (s_aux_x < 0 || s_aux_age > 30 || !g_wide_cur || g_wide_cur_base == s_aux_x ||
+         g_wide_off <= 0 || s_tb_bank_tex || s_ws_ablate != 0) return 0;
+     int native_w = g_wide_w - 2 * g_wide_off;
+     if (native_w <= 0) return 0;
+@@ -3641,6 +3643,13 @@ static int aux_batch_live(int nverts) {
+     }
+     return 0;
+ }
++/* Aux-layer uniforms for the bound tex program (mode: u_aux). */
++static void aux_uniforms(int mode) {
++    int native_w = g_wide_w - 2 * g_wide_off;
++    p_glUniform4i(s_uAuxRect, s_aux_x, s_aux_y0, s_aux_x + native_w, s_aux_y1);
++    p_glUniform4i(s_uAuxGeom, g_wide_off, g_wide_w, s_out_scale, 0);
++    p_glUniform1i(s_uAux, mode);
++}
+ /* The margin copies of a textured batch already bound for drawing into the
+  * current wide surface (vertex data uploaded, tex program in use); wdx is its
+  * plain mirror shift, [sy, sy+sh) its rows. Leaves u_xoff at wdx. */
+@@ -3674,6 +3683,31 @@ static void aux_copy_passes(int nverts, int semi, int mask, int check,
+     p_glUniform1i(s_uAuxShift, 0);
+     p_glUniform1f(s_tex_uXoff, (float)wdx);
+ }
++/* The same copies in the canonical pass, clipped to the draw area (the 4:3
++ * frame): only tiles that straddle the frame's far edge reach it. The 4:3
++ * frame leaves out the blur's seam tiles at its two edges, which no one sees
++ * at 4:3; in widescreen those columns sit between the margins and read as a
++ * dark line. hr is bound with the tex program and the batch's vertices. */
++static void aux_edge_canonical(int nverts, int semi) {
++    GLuint tex = 0;
++    for (int i = 0; i < WIDE_MAX_SURF; i++)
++        if (s_wide_fbo[i] && s_wide_base[i] == s_aux_x) tex = s_wide_tex[i];
++    int native_w = g_wide_w - 2 * g_wide_off;
++    if (!tex || native_w <= 0) return;
++    p_glActiveTexture(PSXGL_TEXTURE0 + 3);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    p_glActiveTexture(PSXGL_TEXTURE0);
++    aux_uniforms(1);
++    for (int side = -1; side <= 1; side += 2) {
++        int shift = side * native_w;
++        p_glUniform1f(s_tex_uXoff, (float)shift);
++        p_glUniform1i(s_uAuxShift, shift);
++        tex_draw_passes_ex(nverts, semi, s_tb_mask, s_mask_check, 1);
++    }
++    p_glUniform1i(s_uAux, 0);
++    p_glUniform1i(s_uAuxShift, 0);
++    p_glUniform1f(s_tex_uXoff, 0.0f);
++}
+ 
+ /* ---- windowed high-resolution surface: deferred mirror queue ------------
+  * Mirroring each batch into the window as it is flushed switches framebuffers
+@@ -3782,6 +3816,7 @@ static int wide_queue_live(void) {
+ static void wide_band_rows(int *sy, int *sh);
+ static void hiw_wide_set(HiCmd *c, int gate) {
+     c->wfbo = g_wide_cur;
++    if (g_wide_cur_base == s_aux_x) s_aux_queued = 1;
+     c->wdx = wide_dx();
+     wide_bd_scale(gate, &c->wscale, &c->wcenter);
+     if (s_hiw) {   /* the window's replay: full width, the draw area's rows */
+@@ -4000,6 +4035,7 @@ static void hiw_flush_tail(void) {
+     if (!s_hiw) p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+     s_hq_n = 0;
+     s_hq_vn = 0;
++    s_aux_queued = 0;
+ }
+ 
+ static void flush_tex_batch_impl(void) {
+@@ -4010,6 +4046,8 @@ static void flush_tex_batch_impl(void) {
+     double cw_t0 = cw_ms();
+     s_cw_batches++; s_batch_total++; s_cw_flush_depth++;
+ 
++    int aux = aux_batch_live(nverts);   /* samples a native-wide aux layer */
++    if (aux && s_aux_queued) hiw_flush_queue();   /* its margins, up to date */
+     hr_begin(1);
+     p_glUseProgram(s_tex_prog);
+     bind_textured_resources(s_tb_bank_tex ? s_tb_bank_tex : s_raw_tex,
+@@ -4022,6 +4060,7 @@ static void flush_tex_batch_impl(void) {
+ 
+     depth_apply_ex(dmode, 1);
+     tex_batch_draw_passes(nverts, semi);
++    if (aux && !s_hiw) aux_edge_canonical(nverts, semi);
+     depth_restore_ex(dmode, 1, nverts);
+ 
+     /* Native-wide mirror — skipped for a batch fully inside the 4:3 frame (its
+@@ -4030,7 +4069,6 @@ static void flush_tex_batch_impl(void) {
+      * frame, so it is never treated as centre-only. */
+     int mirror = g_wide_cur && s_ws_ablate != 1 &&
+                  !(s_tb_gate == 0 && mirror_batch_center_only(nverts));
+-    int aux = aux_batch_live(nverts);   /* margin copies of an aux layer */
+     if (mirror) {   /* the stencil it may leave behind alpha */
+         float sc, ce;
+         wide_bd_scale(s_tb_gate, &sc, &ce);
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,38 @@
+From ef5963968c27be8d6f7fbd603c573ace505105f8 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 10 Oct 2026 19:52:09 +0200
+Subject: [PATCH 04/13] Smooth motion: don't trip the breaker on guest lateness
+ that also happens without generation
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index c1cafafa..ec534b56 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -12769,7 +12769,18 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+          * millisecond: a late guest frame is not its doing unless they
+          * got expensive. */
+         const int cheap = s_fg_reproject && s_fg_gen_cpu_ms < 3.0;
+-        if (gen_recent && !cheap) fg_trip("guest late"); else s_fg_ignored_late++;
++        /* Local patch: a guest that is also late while nothing is being
++         * generated (an interpreted overlay running slow, say) is late on
++         * its own account. Tripping then only turns smoothing off without
++         * helping the guest, so treat lateness seen within 10 s of such a
++         * baseline late frame as the guest's, not generation's. */
++        static double s_fg_baseline_late_s = -1e30;
++        const int baseline = now - s_fg_baseline_late_s < 10.0;
++        if (gen_recent && !cheap && !baseline) fg_trip("guest late");
++        else {
++            s_fg_ignored_late++;
++            if (!gen_recent) s_fg_baseline_late_s = now;
++        }
+     }
+     const char *why = atomic_exchange(&s_fg_hold_reason, NULL);
+     if (why) s_fg_hold_why = why;
+-- 
+2.54.0.windows.1
+

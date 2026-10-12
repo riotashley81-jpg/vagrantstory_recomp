@@ -1,0 +1,189 @@
+From 8a5ac1ecc2945bbf2a3dcbe6a1005aa0990702e6 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 01:31:05 +0200
+Subject: [PATCH 09/13] Native-wide aux: several sources, including display
+ buffers
+
+Effects that paste the previous frame (the other display buffer) over the
+new one now reach the margins like the offscreen-layer blur does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu_gl_renderer.h | 15 ++++---
+ runtime/src/gpu_gl_renderer.c     | 71 ++++++++++++++++++++++---------
+ 2 files changed, 59 insertions(+), 27 deletions(-)
+
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 07552216..506498a6 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -282,13 +282,14 @@ float gl_renderer_get_post_gamma(void);
+ /* Select full native-wide mirror rendering instead of the centre-splice fast
+  * path. Textured edge expansion needs the complete mirror surface. */
+ void gl_renderer_set_wide_fast(int on);
+-/* Native-wide auxiliary target (local patch): a display-sized offscreen layer
+- * at VRAM (x, y) .. (x + display width, y + h) that gpu.c mirrors into its own
+- * wide surface (gpu_ws_set_aux_target). Textured batches that sample it while
+- * drawing into a display buffer are also drawn shifted by the display width
+- * into the reveal margins, reading the layer's own wide margins there.
+- * x < 0 turns it off. */
+-void gl_renderer_set_wide_aux(int x, int y, int h);
++/* Native-wide auxiliary sources (local patch): display-sized VRAM areas at
++ * (x, y) .. (x + display width, y + h) with a wide surface of their own -- an
++ * offscreen layer gpu.c mirrors (gpu_ws_set_aux_target; needs_fresh = 1), or a
++ * display buffer (the previous frame; needs_fresh = 0). Textured batches that
++ * sample one while drawing into another wide surface are also drawn shifted
++ * by the display width into the reveal margins, reading the source's own wide
++ * margins there. Up to 4 sources; x < 0 removes them all. */
++void gl_renderer_set_wide_aux(int x, int y, int h, int needs_fresh);
+ /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
+  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
+  * seam expansion (0 off, 1 = 1 output px above 1x, 2 = 0.5 native px),
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1347d745..4c71c7ba 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -938,13 +938,28 @@ static int    g_wide_w        = 0;           /* wide width (native px); 0 = disa
+ static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+ static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
+ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
+-/* Native-wide auxiliary target (local patch, gl_renderer_set_wide_aux): a
+- * display-sized offscreen layer [s_aux_x, + native width) x [s_aux_y0, s_aux_y1)
+- * with a wide surface of its own. s_aux_age counts presents since it was last
+- * a draw target; its margins are only read while that is recent (Smooth
+- * motion presents in-between frames too, so allow a few dozen). */
+-static int    s_aux_x = -1, s_aux_y0 = 0, s_aux_y1 = 0, s_aux_age = 1000;
+-static int    s_aux_queued = 0;   /* the mirror queue holds draws into it */
++/* Native-wide auxiliary sources (local patch, gl_renderer_set_wide_aux):
++ * display-sized VRAM areas [x, + native width) x [y0, y1) with a wide surface
++ * of their own that the game pastes back over the screen with sprites: an
++ * offscreen layer (needs_fresh: its age counts presents since it was last a
++ * draw target, and its margins are only read while that is recent; Smooth
++ * motion presents in-between frames too, so allow a few dozen), or a display
++ * buffer (the previous frame, always presented). s_aux_x/y0/y1 is the one
++ * the current batch samples (aux_select). */
++#define AUX_MAX 4
++typedef struct { int x, y0, y1, fresh, age; } AuxSrc;
++static AuxSrc s_auxs[AUX_MAX];
++static int    s_auxs_n = 0;
++static int    s_aux_x = -1, s_aux_y0 = 0, s_aux_y1 = 0, s_aux_cur = 0;
++static int    s_aux_queued = 0;   /* the mirror queue holds draws into one */
++static void aux_select(int i) {
++    s_aux_cur = i;
++    s_aux_x = s_auxs[i].x; s_aux_y0 = s_auxs[i].y0; s_aux_y1 = s_auxs[i].y1;
++}
++static int aux_source_of(int base_x) {
++    for (int i = 0; i < s_auxs_n; i++) if (s_auxs[i].x == base_x) return i;
++    return -1;
++}
+ /* Set by gpu_flat_rect for the full-screen-overlay case so the generic
+  * gpu_geometry wide mirror is skipped and the flat path emits its own
+  * full-wide-width pass instead (mirrors sw_draw_flat_rect). */
+@@ -3254,9 +3269,12 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
+ static int s_wide_fast = 1;
+ void gl_renderer_set_wide_fast(int on) {
+     GL_RT_SYNC("set_wide_fast"); s_wide_fast = on ? 1 : 0; }
+-void gl_renderer_set_wide_aux(int x, int y, int h) {
++void gl_renderer_set_wide_aux(int x, int y, int h, int needs_fresh) {
+     GL_RT_SYNC("set_wide_aux");
+-    s_aux_x = x; s_aux_y0 = y; s_aux_y1 = y + h; s_aux_age = 1000;
++    if (x < 0) { s_auxs_n = 0; return; }
++    int i = aux_source_of(x);
++    if (i < 0) { if (s_auxs_n >= AUX_MAX) return; i = s_auxs_n++; }
++    s_auxs[i] = (AuxSrc){ x, y, y + h, needs_fresh ? 1 : 0, 1000 };
+ }
+ int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+ 
+@@ -3631,15 +3649,22 @@ static int mirror_batch_center_only(int nverts) {
+  * the tile pattern continues; texels left or right of the layer's canonical
+  * columns come from its wide surface. */
+ static int aux_batch_live(int nverts) {
+-    if (s_aux_x < 0 || s_aux_age > 30 || !g_wide_cur || g_wide_cur_base == s_aux_x ||
+-        g_wide_off <= 0 || s_tb_bank_tex || s_ws_ablate != 0) return 0;
++    if (s_auxs_n == 0 || !g_wide_cur || g_wide_off <= 0 || s_tb_bank_tex ||
++        s_ws_ablate != 0) return 0;
+     int native_w = g_wide_w - 2 * g_wide_off;
+     if (native_w <= 0) return 0;
+     for (int i = 0; i < nverts; i++) {
+         const float *v = &s_tb[i * TEXV];
+-        if (v[12] == 2.0f && v[25] == 0.0f &&
+-            v[8] >= (float)s_aux_x && v[8] < (float)(s_aux_x + native_w) &&
+-            v[9] + 255.0f >= (float)s_aux_y0 && v[9] < (float)s_aux_y1) return 1;
++        if (v[12] != 2.0f || v[25] != 0.0f) continue;
++        for (int k = 0; k < s_auxs_n; k++) {
++            const AuxSrc *a = &s_auxs[k];
++            if ((a->fresh && a->age > 30) || g_wide_cur_base == a->x) continue;
++            if (v[8] >= (float)a->x && v[8] < (float)(a->x + native_w) &&
++                v[9] + 255.0f >= (float)a->y0 && v[9] < (float)a->y1) {
++                aux_select(k);
++                return 1;
++            }
++        }
+     }
+     return 0;
+ }
+@@ -3752,7 +3777,7 @@ typedef struct {
+     float   wscale, wcenter; /* its backdrop stretch (wide_bd_scale) */
+     int     wsx, wsy, wsw, wsh;  /* its wide-surface scissor (native px) */
+     uint8_t depth;           /* PGXP depth mode (depth_apply) */
+-    uint8_t aux;             /* native-wide aux: 1 margin copies, 2 no plain mirror */
++    uint8_t aux;             /* native-wide aux: 1 margin copies, 2 no plain mirror, source << 2 */
+ } HiCmd;
+ static int s_hq_depth_cur = 0;   /* depth mode of the batch being queued */
+ static int s_hq_aux_cur = 0;     /* aux flags of the batch being queued */
+@@ -3816,7 +3841,7 @@ static int wide_queue_live(void) {
+ static void wide_band_rows(int *sy, int *sh);
+ static void hiw_wide_set(HiCmd *c, int gate) {
+     c->wfbo = g_wide_cur;
+-    if (g_wide_cur_base == s_aux_x) s_aux_queued = 1;
++    if (aux_source_of(g_wide_cur_base) >= 0) s_aux_queued = 1;
+     c->wdx = wide_dx();
+     wide_bd_scale(gate, &c->wscale, &c->wcenter);
+     if (s_hiw) {   /* the window's replay: full width, the draw area's rows */
+@@ -3907,9 +3932,11 @@ static void hiw_replay_wide(void) {
+             depth_apply_ex(c->depth, 1);
+             if (!(c->aux & 2))
+                 tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0);
+-            if (c->aux & 1)
++            if (c->aux & 1) {
++                aux_select(c->aux >> 2);
+                 aux_copy_passes(c->vcount, c->semi, c->mask, c->check,
+                                 c->wdx, c->wsy, c->wsh);
++            }
+             depth_restore_ex(c->depth, 1, c->vcount);
+         } else {
+             if (cur != HQ_GEO) {
+@@ -4083,7 +4110,7 @@ static void flush_tex_batch_impl(void) {
+      * replayed in one render pass at the next sync point (see s_hq), with its
+      * native-wide mirror. No-op unless that mode is engaged. */
+     s_hq_depth_cur = dmode;
+-    s_hq_aux_cur = aux ? (1 | (mirror ? 0 : 2)) : 0;
++    s_hq_aux_cur = aux ? (1 | (mirror ? 0 : 2) | (s_aux_cur << 2)) : 0;
+     if ((hiw_on() || ((mirror || aux) && wide_queue_live())) &&
+         hiw_enqueue_tex(nverts, semi, mirror || aux, s_tb_gate)) mirror = aux = 0;
+     s_hq_depth_cur = 0;
+@@ -6924,7 +6951,10 @@ static void glb_wide_set_target(int base_x) {
+     double t0 = cw_ms(); s_cw_wide_sets++;
+     flush_flat_batch();  /* drain into the OLD target before switching */
+     flush_tex_batch();
+-    if (base_x == s_aux_x) s_aux_age = 0;
++    {
++        int a = aux_source_of(base_x);
++        if (a >= 0) s_auxs[a].age = 0;
++    }
+     g_wide_cur = wide_fbo_for(base_x);
+     g_wide_cur_base = base_x;
+     s_cw_wide_ms += cw_ms() - t0;
+@@ -7250,7 +7280,8 @@ static void gl_perf_present_enter(void) {
+     /* PGXP depth (G1.14): every displayed frame starts with a clear depth
+      * buffer, whatever the game does with its drawing areas. */
+     if (s_depth_used) DEPTH_REQUEST_CLEAR(DCLR_PRESENT);
+-    if (s_aux_age < 1000) s_aux_age++;   /* native-wide aux layer freshness */
++    for (int a = 0; a < s_auxs_n; a++)   /* native-wide aux layer freshness */
++        if (s_auxs[a].age < 1000) s_auxs[a].age++;
+     /* Replay: taken on the emulation thread when the present was recorded. */
+     { extern void psx_ws_dbg_gate_frame_snapshot(void); if (!rth_replaying()) psx_ws_dbg_gate_frame_snapshot(); }
+     if (!s_pf_on || rthf_owns_timer()) return;
+-- 
+2.54.0.windows.1
+

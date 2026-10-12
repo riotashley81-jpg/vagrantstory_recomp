@@ -1,0 +1,60 @@
+format_version = 5
+id = "vs.enhancement.widescreen"
+version = "1.0.0"
+name = "Widescreen"
+author = "VagrantStoryRecomp"
+description = "Renders Vagrant Story wider than 4:3 so more of each room is visible at the sides. Menus, text boxes and the HUD keep their original proportions; the BIOS logo and movies stay 4:3."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "widescreen"
+name = "Widescreen"
+description = "Widens the 3D view instead of stretching it. Off keeps the original 4:3 picture."
+group = "Visual"
+default_enabled = true
+
+[[option]]
+feature = "widescreen"
+id = "aspect"
+label = "Aspect ratio"
+type = "choice"
+default = "16:9"
+
+[[option.choice]]
+value = "16:9"
+label = "16:9"
+
+[[option.choice]]
+value = "16:10"
+label = "16:10"
+
+[[option.choice]]
+value = "21:9"
+label = "21:9 (ultrawide)"
+
+[[option.choice]]
+value = "fit"
+label = "Fit to window"
+
+[[option]]
+feature = "widescreen"
+id = "hud"
+label = "HUD size"
+type = "choice"
+default = "original"
+
+[[option.choice]]
+value = "original"
+label = "Original"
+
+[[option.choice]]
+value = "proportional"
+label = "Smaller on ultrawide"
+
+[[plugin]]
+feature = "widescreen"
+id = "vs.widescreen"

@@ -1,0 +1,75 @@
+From fc37c66a6f9f725983031b77cc26e8b298f932be Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 22:33:53 +0200
+Subject: [PATCH 16/17] Frame generation: no in-between frames for frames that
+ read themselves back
+
+A generated frame redraws the newer frame's list over its finished image, so a
+crossfade sprite that reads the frame back darkened it again from a mix of
+surfaces and showed the low-res copy. Such frames now present as real frames.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 2e3130e9..0ed8c192 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -4999,6 +4999,7 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+  * draw area, i.e. the frame being drawn reads itself back; offscreen layers
+  * (Vagrant Story's depth-of-field tiles) keep the packed source, which their
+  * native-wide margins match. */
++static void fg_mark_fbfb(void);
+ static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp) {
+     const int S = s_hiw ? s_out_scale : s_hr_scale;
+     if (S <= 1 || s_selected_bank_tex) return 0;
+@@ -5012,6 +5013,7 @@ static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp)
+     /* Windowed surface: the 1x hr pass keeps the packed source; the window
+      * tile holding the source is what the replay reads. */
+     const HiwTile *T = NULL;
++    if (!s_fg_drawing) fg_mark_fbfb();   /* even where the copy below is refused */
+     if (s_hiw && (!hiw_on() || !(T = hiw_tile_holding(sx, sx + w)))) return 0;
+     flush_cpu_upload();
+     flush_flat_batch();
+@@ -11233,6 +11235,7 @@ typedef struct {
+     FgState   start;                           /* draw state at the list start */
+     int       valid, wide, disp[4];            /* closed: display rect it shows */
+     int       wide_w, wide_off, scale, linear, force43;
++    int       fbfb;                            /* reads itself back (fbfb_begin) */
+ } FgList;
+ static int rp_is_car(const FgList *L, uint32_t pi);
+ /* Raw triangle captured while recording a list (absolute coords). */
+@@ -11716,12 +11719,17 @@ static void fg_list_close(FgList *l, const int disp[4]) {
+ static void fg_list_open(void) {
+     FgList *l = &s_fg_l[s_fg_cur];
+     fg_list_clear(l);
++    l->fbfb = 0;
+     fg_state_capture(&l->start);
+     s_fg_nraw = 0;
+     s_fg_pc_valid = 0;
+     s_fg_src_valid = 0;
+ }
+ 
++static void fg_mark_fbfb(void) {
++    if (s_fg_cur >= 0 && s_fg_cur < 4) s_fg_l[s_fg_cur].fbfb = 1;
++}
++
+ static void fg_invalidate(void) {
+     for (int i = 0; i < 4; i++) s_fg_l[i].valid = 0;
+     s_fg_have_last = 0;
+@@ -12625,6 +12633,10 @@ static int fg_generate(double t, int swap) {
+     if (s_fg_pa < 0 || s_fg_pb < 0) return 0;
+     FgList *a = &s_fg_l[s_fg_pa], *b = &s_fg_l[s_fg_pb];
+     if (!a->valid || !b->valid || s_hiw) return 0;
++    /* A frame that reads itself back (a crossfade, fbfb_begin) has no
++     * in-between: its redraw would darken the newer frame's finished image
++     * again. The real frame is shown instead. */
++    if (a->fbfb || b->fbfb) return 0;
+     if (b->wide && (g_wide_w <= 0 || g_wide_w != b->wide_w)) return 0;
+     int iw = -1;
+     if (b->wide) {
+-- 
+2.54.0.windows.1
+

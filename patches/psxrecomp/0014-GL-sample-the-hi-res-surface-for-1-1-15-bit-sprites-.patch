@@ -1,0 +1,182 @@
+From 30733c50193618cc6b0dbd3b84d18809482c87ca Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 21:46:41 +0200
+Subject: [PATCH 14/17] GL: sample the hi-res surface for 1:1 15-bit sprites
+ that read the frame being drawn
+
+Vagrant Story's menu crossfade redraws the frame it just rendered, darkened,
+every frame. Reading it back through the packed 1x VRAM snapped flat areas of
+the undithered hi-res image to one 5-bit step, so the fade broke into black
+blotches. Such sprites now sample a copy of the hr surface (canonical pass
+only).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 81 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 0b1989d3..0d36f298 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -797,6 +797,10 @@ static GLint s_uPalette = -1;
+ static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+ static GLint s_uMaskset = -1, s_uFilter = -1;
+ static GLint s_uAux = -1, s_uAuxTex = -1, s_uAuxRect = -1, s_uAuxGeom = -1, s_uAuxShift = -1;
++/* Hi-res framebuffer feedback (local patch, see fbfb_begin). */
++static GLint s_uFb = -1, s_uFbTex = -1, s_uFbOrg = -1;
++static GLuint s_fbfb_tex = 0;
++static int s_fbfb_w = 0, s_fbfb_h = 0, s_fbfb_live = 0;
+ static GLint s_uLimits = -1;
+ /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
+  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
+@@ -1955,6 +1959,12 @@ static const char *TEX_FS =
+     "uniform ivec4 u_aux_rect; /* canonical x0, y0, x1, y1 (exclusive) */\n"
+     "uniform ivec4 u_aux_geom; /* wide OFFSET, wide width, surface scale, - */\n"
+     "uniform int u_aux_shift;  /* texel x shift of this copy */\n"
++    "/* Hi-res framebuffer feedback (local patch): a 1:1 15-bit sprite that\n"
++    "   reads rendered pixels samples a copy of the hr surface instead of the\n"
++    "   packed 1x VRAM, so fades keep their resolution and colour depth. */\n"
++    "uniform int u_fb;         /* 1: sample u_fb_tex */\n"
++    "uniform sampler2D u_fb_tex;\n"
++    "uniform ivec4 u_fb_org;   /* copy origin in hr px, surface scale, - */\n"
+     "int vram_at(int x, int y){\n"
+     "  ivec2 p = ivec2(x & 1023, y & 511);\n"
+     "  if (any(greaterThanEqual(p, textureSize(u_vram, 0)))) return 0;\n"
+@@ -2073,6 +2083,14 @@ static const char *TEX_FS =
+     "    if (raw == 0) discard;\n"
+     "    rgb = col5(raw);\n"
+     "    stp = (raw >> 15) & 1;\n"
++    "  } else if (u_fb == 1 && v_depth == 2) {\n"
++    "    ivec2 hp = ivec2(floor((vec2(v_tpage) + uv) * float(u_fb_org.z))) - u_fb_org.xy;\n"
++    "    vec4 a = texelFetch(u_fb_tex, clamp(hp, ivec2(0), textureSize(u_fb_tex, 0) - 1), 0);\n"
++    "    ivec3 c5 = ivec3(a.rgb * 255.0 + 0.5) >> 3;   /* as PACK_FS */\n"
++    "    int raw = c5.r | (c5.g << 5) | (c5.b << 10) | (a.a >= 0.5 ? 0x8000 : 0);\n"
++    "    if (raw == 0) discard;\n"
++    "    rgb = a.rgb;\n"
++    "    stp = (raw >> 15) & 1;\n"
+     "  } else if (v_hd_mode != 0) {\n"
+     "    vec4 hd=hd_texel(uv);\n"
+     "    rgb=hd.rgb;\n"
+@@ -2134,7 +2152,7 @@ static const char *TEX_FS =
+     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+     "    stp = stpf >= 0.5 ? 1 : 0;\n"
+     "  }\n"
+-    "  if ((u_filter & 16) != 0 && v_hd_mode == 0 && u_aux == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
++    "  if ((u_filter & 16) != 0 && v_hd_mode == 0 && u_aux == 0 && u_fb == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
+     "  if (v_raw == 0) rgb = clamp(rgb * (v_cp != 0 ? v_col_p : v_col.rgb) * 2.0, 0.0, 1.0);\n"
+@@ -3507,6 +3525,7 @@ static void bind_textured_resources(GLuint source, GLuint palette, GLuint hd) {
+     glBindTexture(GL_TEXTURE_2D, hd ? hd : s_up_tex); p_glUniform1i(s_uHdTexture, 2);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     p_glUniform1i(s_uAuxTex, 3);   /* never shares unit 0 with u_vram's usampler */
++    p_glUniform1i(s_uFbTex, 4);
+ }
+ static int   s_tb_twin[4] = {0, 0, 0, 0};
+ static uint64_t s_batch_total = 0, s_batch_reason[8];
+@@ -4087,6 +4106,7 @@ static void flush_tex_batch_impl(void) {
+ 
+     depth_apply_ex(dmode, 1);
+     tex_batch_draw_passes(nverts, semi);
++    if (s_fbfb_live) p_glUniform1i(s_uFb, 0);   /* hr only; mirrors read the pack */
+     if (aux && !s_hiw) aux_edge_canonical(nverts, semi);
+     depth_restore_ex(dmode, 1, nverts);
+ 
+@@ -4959,6 +4979,58 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+     }
+ }
+ 
++/* Hi-res framebuffer feedback (local patch). A sprite that copies rendered
++ * pixels 1:1 out of a 15-bit page (Vagrant Story's menu crossfade redraws the
++ * frame it just rendered, darkened, every frame) would read the packed 1x
++ * VRAM: one point sample per PS1 pixel at 5 bits per channel. Undithered
++ * hi-res shading then snaps whole flat areas to one 5-bit step and the fade
++ * breaks into black blotches. Such a sprite samples a copy of the hr surface
++ * instead (canonical pass only; native-wide mirrors and the windowed surface
++ * keep the packed source). It applies only when the source overlaps the
++ * draw area, i.e. the frame being drawn reads itself back; offscreen layers
++ * (Vagrant Story's depth-of-field tiles) keep the packed source, which their
++ * native-wide margins match. */
++static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp) {
++    const int S = s_hr_scale;
++    if (S <= 1 || s_hiw || s_selected_bank_tex) return 0;
++    if (((tp >> 7) & 3) != 2) return 0;                  /* 15-bit page */
++    if (s_tw_mask_x | s_tw_mask_y) return 0;             /* no texture window */
++    if (u1 - u0 != w || v1 - v0 != h || u1 > 256 || v1 > 256) return 0;   /* 1:1 */
++    int sx = (tp & 0xF) * 64 + u0, sy = ((tp >> 4) & 1) * 256 + v0;
++    if (sx + w > VRAM_W || sy + h > VRAM_H) return 0;
++    if (sx > s_area_x2 || sx + w - 1 < s_area_x1 ||
++        sy > s_area_y2 || sy + h - 1 < s_area_y1) return 0;
++    flush_cpu_upload();
++    flush_flat_batch();
++    flush_tex_batch();
++    int cw = w * S, ch = h * S;
++    if (!s_fbfb_tex || cw > s_fbfb_w || ch > s_fbfb_h) {
++        if (s_fbfb_tex) glDeleteTextures(1, &s_fbfb_tex);
++        if (cw > s_fbfb_w) s_fbfb_w = cw;
++        if (ch > s_fbfb_h) s_fbfb_h = ch;
++        s_fbfb_tex = make_tex(GL_RGBA8, s_fbfb_w, s_fbfb_h, GL_RGBA, GL_UNSIGNED_BYTE);
++    }
++    p_glActiveTexture(PSXGL_TEXTURE0 + 4);
++    glBindTexture(GL_TEXTURE_2D, s_fbfb_tex);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sx * S, sy * S, cw, ch);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
++    p_glActiveTexture(PSXGL_TEXTURE0);
++    p_glUseProgram(s_tex_prog);
++    p_glUniform4i(s_uFbOrg, sx * S, sy * S, S, 0);
++    p_glUniform1i(s_uFb, 1);
++    p_glUseProgram(0);
++    s_fbfb_live = 1;
++    return 1;
++}
++static void fbfb_end(void) {
++    flush_tex_batch();
++    p_glUseProgram(s_tex_prog);
++    p_glUniform1i(s_uFb, 0);
++    p_glUseProgram(0);
++    s_fbfb_live = 0;
++}
++
+ static void gpu_textured_rect(int x,int y,int w,int h,
+                               int u0,int v0,int u1,int v1,
+                               uint16_t clut_x,uint16_t clut_y,uint16_t tp,int semi) {
+@@ -4971,6 +5043,7 @@ static void gpu_textured_rect(int x,int y,int w,int h,
+      * from the original corners, then the mirror bump (see gpu_uv.h). */
+     int lim[4];
+     psx_uv_rect_limits(u0, v0, u1, v1, lim);
++    int fb = fbfb_begin(w, h, u0, v0, u1, v1, tp);
+     psx_uv_rect_mirror_offset(&u0, &v0, &u1, &v1);
+     int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
+     int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
+@@ -4978,6 +5051,7 @@ static void gpu_textured_rect(int x,int y,int w,int h,
+     int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
+     int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
+     gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi,lim);
++    if (fb) fbfb_end();
+ }
+ 
+ /* GP0(02h) fill: writes color with bit15=0, ignoring draw area, mask and
+@@ -5827,6 +5901,8 @@ static void free_hr_targets(void) {
+     if (s_hr_tex)      { glDeleteTextures(1, &s_hr_tex); s_hr_tex = 0; }
+     if (s_scratch_tex) { glDeleteTextures(1, &s_scratch_tex); s_scratch_tex = 0; }
+     s_scratch_w = s_scratch_h = 0;
++    if (s_fbfb_tex) { glDeleteTextures(1, &s_fbfb_tex); s_fbfb_tex = 0; }
++    s_fbfb_w = s_fbfb_h = 0;
+ }
+ 
+ /* Allocate the authoritative hr surface at scale S. Returns 1 when every
+@@ -6004,6 +6080,9 @@ static int init_gpu_raster(void) {
+     s_uAuxRect  = p_glGetUniformLocation(s_tex_prog, "u_aux_rect");
+     s_uAuxGeom  = p_glGetUniformLocation(s_tex_prog, "u_aux_geom");
+     s_uAuxShift = p_glGetUniformLocation(s_tex_prog, "u_aux_shift");
++    s_uFb       = p_glGetUniformLocation(s_tex_prog, "u_fb");
++    s_uFbTex    = p_glGetUniformLocation(s_tex_prog, "u_fb_tex");
++    s_uFbOrg    = p_glGetUniformLocation(s_tex_prog, "u_fb_org");
+     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
+     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
+     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
+-- 
+2.54.0.windows.1
+

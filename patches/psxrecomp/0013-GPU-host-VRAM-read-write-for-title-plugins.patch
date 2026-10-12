@@ -1,0 +1,76 @@
+From acb92cd349c8237bb280c99290c7312965693382 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 20:22:20 +0200
+Subject: [PATCH 13/13] GPU: host VRAM read/write for title plugins
+
+gpu_host_vram_read copies from the CPU VRAM array; gpu_host_vram_write
+uploads through a GP0(A0h) transfer (refused while GP0 is busy), so every
+renderer, savestates and dirty tracking follow.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h |  4 ++++
+ runtime/src/gpu.c     | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 0558f6c3..35874187 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -105,6 +105,10 @@ void gpu_ws_set_local_viewport_native_wide(int enabled);
+ int psx_ws_is_local_viewport_width_site(uint32_t pc);
+ void gpu_vertical_split_debug(int *active, int *left_age, int *right_age);
+ uint16_t gpu_vram_peek(int x, int y);
++/* Title plugins (local patch): read the CPU VRAM array / write through a
++ * GP0(A0h) upload. Both return 0 when refused (bounds, GP0 busy). */
++int gpu_host_vram_read(int x, int y, int w, int h, uint16_t *out);
++int gpu_host_vram_write(int x, int y, int w, int h, const uint16_t *px);
+ 
+ /* Shaded quad vertex capture (Phase 4.5 debug). */
+ typedef struct {
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index fd68480b..499618a1 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -7320,6 +7320,38 @@ void gpu_get_draw_area(GpuDrawArea* out) {
+     out->offset_y = draw_offset_y;
+ }
+ 
++/* Host-side VRAM access for title plugins (local patch). Reads come from the
++ * CPU VRAM array, which is authoritative for CPU-uploaded data (texture and
++ * font pages); GPU-drawn areas may lag it under the GL backend. Writes go
++ * through a GP0(A0h) CPU-to-VRAM transfer, the same path as a game upload,
++ * so every renderer, the savestate image and the dirty tracking follow; they
++ * are refused (0) while a GP0 command or transfer is in flight, and ignore
++ * the mask-bit settings. */
++int gpu_host_vram_read(int x, int y, int w, int h, uint16_t *out) {
++    if (!out || w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > 1024 || y + h > 512)
++        return 0;
++    for (int j = 0; j < h; j++)
++        memcpy(out + (size_t)j * w, &vram[(size_t)(y + j) * 1024u + x], (size_t)w * 2u);
++    return 1;
++}
++int gpu_host_vram_write(int x, int y, int w, int h, const uint16_t *px) {
++    if (!px || w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > 1024 || y + h > 512)
++        return 0;
++    if (gp0_state != GP0_IDLE) return 0;
++    const uint32_t saved_set = set_mask_bit, saved_check = check_mask_bit;
++    set_mask_bit = 0;
++    check_mask_bit = 0;
++    gpu_write_gp0(0xA0000000u);
++    gpu_write_gp0(((uint32_t)y << 16) | (uint32_t)x);
++    gpu_write_gp0(((uint32_t)h << 16) | (uint32_t)w);
++    const int n = w * h;
++    for (int i = 0; i < n; i += 2)
++        gpu_write_gp0((uint32_t)px[i] | (i + 1 < n ? (uint32_t)px[i + 1] << 16 : 0u));
++    set_mask_bit = saved_set;
++    check_mask_bit = saved_check;
++    return 1;
++}
++
+ uint16_t gpu_vram_peek(int x, int y) {
+     if (x < 0 || x >= 1024 || y < 0 || y >= 512) return 0;
+     /* Through the facade so the GL backend syncs its FBO down first. */
+-- 
+2.54.0.windows.1
+

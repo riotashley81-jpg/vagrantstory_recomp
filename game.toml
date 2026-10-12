@@ -1,0 +1,82 @@
+# Autofilled by tools/new_project_layout/probe_disc.py from your legal dump.
+# Review before shipping. Runtime quirks / overlay seeds still need hand work.
+
+[game]
+name = "VagrantStory"
+id = "SLUS-01040"
+players = 1
+exe = "disc/SLUS_010.40"
+disc = "disc/Vagrant Story (USA).cue"   # point this at your own dump
+load_address = "0x80010000"
+entry_pc = "0x8001F544"
+text_size = "0x00052000"
+stack_base = "0x801FFFF0"
+
+# Digests are for data Track 01 (first BINARY FILE / TRACK 01).
+[prepare_disc]
+out_dir = "disc"
+bin_name = "Vagrant Story (USA).bin"
+cue_name = "Vagrant Story (USA).cue"
+boot_exe = "SLUS_010.40"
+known_sizes = [750643152]
+known_md5 = [
+  "8531bc73ea7cd33a4c8e97bdf139ba9c",
+]
+known_sha1 = [
+  "38c63db6c49a06b91d87cd5a4e31b1ec68fe212c",
+]
+known_crc32 = [
+  "eb695a2e",
+]
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+# Mod instruction hooks (overlay code; see src/vs_skip_logos.c).
+mod_instruction_sites = ["0x8006F6EC"]
+
+[runtime]
+window_title = "VagrantStory Recompiled"
+memcard_dir = "saves"
+overlay_cache = true
+
+[video]
+renderer = "opengl"
+aspect_ratio = "4:3"
+# Default render resolution; players change it in Settings -> Display.
+internal_resolution = "display"
+# Smooth motion: the render thread redraws in-between frames from the camera
+# (docs/FRAME_GENERATION.md, "redraw"). Players toggle it in Settings -> Display.
+render_thread = true
+frame_generation = true
+frame_generation_method = "redraw"
+
+# Widescreen is offered by the vs.enhancement.widescreen mod (launcher Mods
+# page). These keep screen-space menus/HUD at their original proportions
+# while the 3D view widens.
+[widescreen]
+hud_sprt_squash = true
+auto_ui_squash = true
+auto_ui_anchor = "edges"
+
+# BATTLE.PRG (loads at 0x80068800) map-polygon screen rejects. Each renderer
+# drops a polygon when ALL its vertices are left of x=0 or right of x=320;
+# widened views move both edges out by the live reveal margin (identity at 4:3).
+[widescreen.cull]
+# quad funnel 0x80098014: "slti at,xN,320" / "slti at,xN,0"
+# tri funnel 0x8009820c (x biased +160): same pair of tests
+slti_sites = ["0x800980BC", "0x800980C4", "0x800980CC", "0x800980D4",
+              "0x80098304", "0x8009830C", "0x80098314"]
+slti_lower_sites = ["0x80098094", "0x8009809C", "0x800980A4", "0x800980AC",
+                    "0x800982E4", "0x800982EC", "0x800982F4"]
+
+[controller]
+default_mode = "digital"
+
+# Online mount gate: digests + track count + optional TOC fingerprint
+# (see docs/NETPLAY.md).
+[netplay]
+require_cue = true
+required_tracks = 1
+required_disc_fp = "671e8a6aefa47f9d5ae9bd4a2f3a50952ccb619a8be3013cd42b9b41302a7651"

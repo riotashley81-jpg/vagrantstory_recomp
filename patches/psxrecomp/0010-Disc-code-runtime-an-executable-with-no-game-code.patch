@@ -1,0 +1,95 @@
+From 35fd6d5f0f1205e59e52deedb5bf4377fce2bd76 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 14:12:25 +0200
+Subject: [PATCH 10/13] Disc-code runtime: an executable with no game code
+
+PSXRECOMP_DISC_CODE links no game C and the bundled BIOS only, skips the
+first-run Generate & rebuild host, and routes every game PC through the
+dirty-RAM interpreter; the bundled overlay toolchain compiles hot code into
+the local cache as it does for overlays.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/runtime.cmake | 21 ++++++++++++++++++---
+ runtime/src/memory.c  |  5 +++++
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 90828572..83f07b91 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -2596,6 +2596,13 @@ function(psxrecomp_add_game_runtime target)
+         "Build without linking game C even if generated/ exists" OFF)
+     option(PSXRECOMP_REQUIRE_GAME_C
+         "Fail configure if generated game C is missing" OFF)
++    # Local patch: an executable that carries none of the game's code. The
++    # game's code is read from the player's disc at runtime and run by the
++    # dirty-RAM interpreter (the overlay path), and the bundled overlay
++    # toolchain compiles what is hot into the local cache. Links the bundled
++    # BIOS only; no first-run Generate & rebuild.
++    option(PSXRECOMP_DISC_CODE
++        "Link no game C: run the game's code from the player's disc" OFF)
+ 
+     # Legacy BPE option name (CI / docs may still pass -DBPE_FORCE_SETUP_HOST=ON).
+     if(BPE_FORCE_SETUP_HOST)
+@@ -2737,7 +2744,8 @@ function(psxrecomp_add_game_runtime target)
+     endif()
+ 
+     set(_psxg_has_game_c FALSE)
+-    if(EXISTS "${_psxg_marker}" AND NOT PSXRECOMP_FORCE_SETUP_HOST)
++    if(EXISTS "${_psxg_marker}" AND NOT PSXRECOMP_FORCE_SETUP_HOST
++       AND NOT PSXRECOMP_DISC_CODE)
+         set(_psxg_has_game_c TRUE)
+     endif()
+ 
+@@ -2757,7 +2765,7 @@ function(psxrecomp_add_game_runtime target)
+     # psxrecomp_codegen_host.c unconditionally includes recomp_launcher.h, so
+     # the title's setup host and the shared host implementation can only be
+     # built alongside the recomp-ui submodule (PSX_RECOMP_UI).
+-    if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES)
++    if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES AND NOT PSXRECOMP_DISC_CODE)
+         list(APPEND _psxg_extras ${PSXG_CODEGEN_SETUP_SOURCES})
+         list(APPEND _psxg_extras
+             "${PSXRECOMP_ROOT}/host/psxrecomp_codegen_host.c")
+@@ -2829,6 +2837,13 @@ function(psxrecomp_add_game_runtime target)
+         if(TARGET ${target}-pgxp)
+             list(APPEND _psxg_targets ${target}-pgxp)
+         endif()
++    elseif(PSXRECOMP_DISC_CODE)
++        message(STATUS
++            "psxrecomp: disc-code runtime (no game C) — the game's code runs "
++            "from the player's disc (interpreter + runtime compile)")
++        psxrecomp_add_runtime_target(${target} ${_psxg_rt_args})
++        target_compile_definitions(${target} PRIVATE PSX_DISC_CODE=1)
++        set(_psxg_targets ${target})
+     else()
+         message(STATUS
+             "psxrecomp: setup host (no game C, no BIOS backends) — "
+@@ -2843,7 +2858,7 @@ function(psxrecomp_add_game_runtime target)
+         # C is linked"): this only fires when a codegen_setup.c-style host was
+         # actually provided, since that file needs recomp-ui/launcher headers
+         # that a --no-recomp-ui build does not have.
+-        if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES)
++        if(PSX_RECOMP_UI AND PSXG_CODEGEN_SETUP_SOURCES AND NOT PSXRECOMP_DISC_CODE)
+             target_compile_definitions(${_psxg_t} PRIVATE PSX_HAS_CODEGEN_SETUP_HOST=1)
+         endif()
+ 
+diff --git a/runtime/src/memory.c b/runtime/src/memory.c
+index a0b63a73..442e0ae0 100644
+--- a/runtime/src/memory.c
++++ b/runtime/src/memory.c
+@@ -766,6 +766,11 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
+  * dirty_ram_is_dirty (top dispatch, dirty_ram_dispatch_inner gates, the
+  * psx_dispatch_game_compiled gates) — no emitter/dispatch change needed. */
+ static int dirty_ram_force_interp(void) {
++#ifdef PSX_DISC_CODE
++    /* Local patch: a disc-code runtime links no game C; every game PC runs
++     * from the bytes the player's disc loaded (interpreter + runtime compile). */
++    return 1;
++#endif
+     static int s = -1;
+     if (s < 0) { const char* e = getenv("PSX_FORCE_INTERP"); s = (e && e[0] && e[0] != '0'); }
+     return s;
+-- 
+2.54.0.windows.1
+

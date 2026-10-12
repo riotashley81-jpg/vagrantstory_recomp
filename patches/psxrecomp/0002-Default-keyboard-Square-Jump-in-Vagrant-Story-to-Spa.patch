@@ -1,0 +1,27 @@
+From 75881f0e7aafb976118cdcf2afda795c556e431f Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 10 Oct 2026 15:56:10 +0200
+Subject: [PATCH 02/13] Default keyboard Square (Jump in Vagrant Story) to
+ Space
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/psx_keybinds.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/src/psx_keybinds.c b/runtime/src/psx_keybinds.c
+index 74019573..8d5dcbae 100644
+--- a/runtime/src/psx_keybinds.c
++++ b/runtime/src/psx_keybinds.c
+@@ -54,7 +54,7 @@
+     .up = SDL_SCANCODE_UP, .down = SDL_SCANCODE_DOWN, \
+     .left = SDL_SCANCODE_LEFT, .right = SDL_SCANCODE_RIGHT, \
+     .cross = SDL_SCANCODE_X, .circle = SDL_SCANCODE_S, \
+-    .square = SDL_SCANCODE_Z, .triangle = SDL_SCANCODE_A, \
++    .square = SDL_SCANCODE_SPACE, .triangle = SDL_SCANCODE_A, \
+     .l1 = SDL_SCANCODE_Q, .r1 = SDL_SCANCODE_W, \
+     .l2 = SDL_SCANCODE_E, .r2 = SDL_SCANCODE_R, \
+     .l3 = SDL_SCANCODE_T, .r3 = SDL_SCANCODE_Y, \
+-- 
+2.54.0.windows.1
+

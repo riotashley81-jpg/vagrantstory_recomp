@@ -1,0 +1,32 @@
+From 9987f4f80a7ea097bcfdcdfb3d6984aee12b9bc2 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 00:05:21 +0200
+Subject: [PATCH 05/13] Smooth motion: tighten object vertex pairing to stop
+ stretched polygons
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/frame_gen.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index 5c4b1580..a8c877f6 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -44,7 +44,12 @@ void fg_cam_defaults(FgCamParams *p) {
+     p->min_pairs = 24;
+     p->max_angle = 0.35f;
+     p->max_shift = 0.5f;
+-    p->max_obj = 0.25f;
++    /* Local patch (Vagrant Story): 0.25 let a vertex pair with a different
++     * vertex of the same model that shares its identity (segmented
++     * characters reuse model-space coordinates across bones), and the
++     * in-between frames then stretched polygons far off the model. Real
++     * motion between two 30 Hz game frames stays well under 6% of depth. */
++    p->max_obj = 0.06f;
+     p->keep_partial = 0;
+     p->freeze_small_views = 0;
+ }
+-- 
+2.54.0.windows.1
+

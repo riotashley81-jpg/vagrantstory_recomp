@@ -1,0 +1,345 @@
+From 063c8646db849c27a462317b3d9cc22d9189791d Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 00:42:13 +0200
+Subject: [PATCH 06/13] Native-wide: auxiliary offscreen layer with reveal
+ margins
+
+A display-sized offscreen layer that a game pastes back over the screen
+(Vagrant Story's depth-of-field blur) gets a wide surface of its own, and
+textured batches sampling it are drawn again into the display's margins,
+shifted by whole display widths, reading the layer's wide margins.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h             |   5 ++
+ runtime/include/gpu_gl_renderer.h |   7 ++
+ runtime/src/gpu.c                 |   8 ++
+ runtime/src/gpu_gl_renderer.c     | 136 ++++++++++++++++++++++++++++--
+ 4 files changed, 149 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index d16a3280..0558f6c3 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -466,6 +466,11 @@ void gpu_ws_set_gameplay_state_gate(uint32_t addr,
+                                     const uint32_t *values, int nvalues);
+ /* [netplay] local_viewport_state_*: a split frame counts as a vertical split
+  * (netplay local viewport) only while this word holds one of the values. */
++/* Native-wide auxiliary target (local patch): draws whose draw area starts at
++ * VRAM (x, y) go to a wide surface of their own, so a display-sized offscreen
++ * layer the game composites back onto the screen keeps its reveal margins.
++ * x < 0 turns it off. */
++void gpu_ws_set_aux_target(int x, int y);
+ void gpu_ws_set_local_viewport_state_gate(uint32_t addr,
+                                           const uint32_t *values, int nvalues);
+ /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 0b2eabbe..07552216 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -282,6 +282,13 @@ float gl_renderer_get_post_gamma(void);
+ /* Select full native-wide mirror rendering instead of the centre-splice fast
+  * path. Textured edge expansion needs the complete mirror surface. */
+ void gl_renderer_set_wide_fast(int on);
++/* Native-wide auxiliary target (local patch): a display-sized offscreen layer
++ * at VRAM (x, y) .. (x + display width, y + h) that gpu.c mirrors into its own
++ * wide surface (gpu_ws_set_aux_target). Textured batches that sample it while
++ * drawing into a display buffer are also drawn shifted by the display width
++ * into the reveal margins, reading the layer's own wide margins there.
++ * x < 0 turns it off. */
++void gl_renderer_set_wide_aux(int x, int y, int h);
+ /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
+  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
+  * seam expansion (0 off, 1 = 1 output px above 1x, 2 = 0.5 native px),
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 12c20343..f67660bc 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -3621,12 +3621,20 @@ void gpu_vertical_split_debug(int *active, int *left_age, int *right_age) {
+ /* Point the renderer's wide mirror at the current back buffer (draw_area_left)
+  * when native-wide is active and that buffer is a known display buffer; else
+  * disable mirroring for this draw. Called when the draw env changes. */
++static int ws_aux_x = -1, ws_aux_y = 0;
++void gpu_ws_set_aux_target(int x, int y) { ws_aux_x = x; ws_aux_y = y; }
++
+ static void ws_nw_sync_target(void) {
+     if (!ws_native_wide_active()) {
+         gr_wide_set_view(0, 0, 0, 0);
+         gr_wide_disable_target(); return;
+     }
+     gr_wide_configure(ws_nw_present_width(), ws_nw_offset());
++    if (ws_aux_x >= 0 && (int)draw_area_left == ws_aux_x &&
++        (int)draw_area_top == ws_aux_y) {   /* offscreen layer with margins */
++        gr_wide_set_target(ws_aux_x);
++        return;
++    }
+     int local_base = 0;
+     if (ws_local_viewport_draw_target(&local_base)) {
+         gr_wide_set_target(local_base);
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index ec534b56..7daadfde 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -796,6 +796,7 @@ static GLint s_uHdTexture = -1;
+ static GLint s_uPalette = -1;
+ static GLint s_uRaw = -1, s_uSemipass = -1, s_uSemimode = -1;
+ static GLint s_uMaskset = -1, s_uFilter = -1;
++static GLint s_uAux = -1, s_uAuxTex = -1, s_uAuxRect = -1, s_uAuxGeom = -1, s_uAuxShift = -1;
+ static GLint s_uLimits = -1;
+ /* Native-wide x-projection uniforms (per program). u_xoff = x translation in
+  * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
+@@ -937,6 +938,11 @@ static int    g_wide_w        = 0;           /* wide width (native px); 0 = disa
+ static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+ static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
+ static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
++/* Native-wide auxiliary target (local patch, gl_renderer_set_wide_aux): a
++ * display-sized offscreen layer [s_aux_x, + native width) x [s_aux_y0, s_aux_y1)
++ * with a wide surface of its own. s_aux_age counts presents since it was last
++ * a draw target; its margins are only read while that is recent. */
++static int    s_aux_x = -1, s_aux_y0 = 0, s_aux_y1 = 0, s_aux_age = 1000;
+ /* Set by gpu_flat_rect for the full-screen-overlay case so the generic
+  * gpu_geometry wide mirror is skipped and the flat path emits its own
+  * full-wide-width pass instead (mirrors sw_draw_flat_rect). */
+@@ -1924,6 +1930,14 @@ static const char *TEX_FS =
+     "uniform int u_filter;    /* bits 0-3: 0 nearest, 1 bilinear, 2 stable; bit 4: LOD */\n"
+     "uniform int u_aniso;     /* [video] anisotropic_filtering, 1..16 */\n"
+     "uniform float u_shift;\n"
++    "/* Native-wide auxiliary target (local patch): a shifted copy of a batch\n"
++    "   that samples a display-sized offscreen layer reads that layer's\n"
++    "   wide-surface margins outside its canonical columns. */\n"
++    "uniform int u_aux;        /* 1: aux copy pass */\n"
++    "uniform sampler2D u_aux_tex;\n"
++    "uniform ivec4 u_aux_rect; /* canonical x0, y0, x1, y1 (exclusive) */\n"
++    "uniform ivec4 u_aux_geom; /* wide OFFSET, wide width, surface scale, - */\n"
++    "uniform int u_aux_shift;  /* texel x shift of this copy */\n"
+     "int vram_at(int x, int y){\n"
+     "  ivec2 p = ivec2(x & 1023, y & 511);\n"
+     "  if (any(greaterThanEqual(p, textureSize(u_vram, 0)))) return 0;\n"
+@@ -2024,7 +2038,25 @@ static const char *TEX_FS =
+     "  vec2 uv = (v_persp != 0) ? v_uv_p : v_uv;\n"
+     "  vec2 dx=dFdx(uv), dy=dFdy(uv);\n"
+     "  vec2 uv0=uv, dx0=dx, dy0=dy;   /* the PS1 sample point (texture_lod) */\n"
+-    "  if (v_hd_mode != 0) {\n"
++    "  if (u_aux != 0) {\n"
++    "    if (v_depth != 2 || v_hd_mode != 0 ||\n"
++    "        v_tpage.x < u_aux_rect.x || v_tpage.x >= u_aux_rect.z) discard;\n"
++    "    int ax = v_tpage.x + int(floor(uv.x)) + u_aux_shift;\n"
++    "    int ay = v_tpage.y + int(floor(uv.y));\n"
++    "    if (ay < u_aux_rect.y || ay >= u_aux_rect.w) discard;\n"
++    "    int raw;\n"
++    "    if (ax >= u_aux_rect.x && ax < u_aux_rect.z) raw = vram_at(ax, ay);\n"
++    "    else {\n"
++    "      int lx = ax - u_aux_rect.x + u_aux_geom.x;\n"
++    "      if (lx < 0 || lx >= u_aux_geom.y) discard;\n"
++    "      vec4 a = texelFetch(u_aux_tex, ivec2(lx, ay) * u_aux_geom.z, 0);\n"
++    "      ivec3 c5 = ivec3(floor(a.rgb * 31.0 + 0.5));\n"
++    "      raw = c5.r | (c5.g << 5) | (c5.b << 10) | (a.a > 0.5 ? 0x8000 : 0);\n"
++    "    }\n"
++    "    if (raw == 0) discard;\n"
++    "    rgb = col5(raw);\n"
++    "    stp = (raw >> 15) & 1;\n"
++    "  } else if (v_hd_mode != 0) {\n"
+     "    vec4 hd=hd_texel(uv);\n"
+     "    rgb=hd.rgb;\n"
+     "    if(v_hd_mode==1){\n"
+@@ -2085,7 +2117,7 @@ static const char *TEX_FS =
+     "                + float((c01 >> 15) & 1) * w01 + float((c11 >> 15) & 1) * w11) / opac;\n"
+     "    stp = stpf >= 0.5 ? 1 : 0;\n"
+     "  }\n"
+-    "  if ((u_filter & 16) != 0 && v_hd_mode == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
++    "  if ((u_filter & 16) != 0 && v_hd_mode == 0 && u_aux == 0) rgb = lod_sample(uv0, dx0, dy0, stp, rgb);\n"
+     "  if (u_semipass == 1 && stp == 1) discard;\n"
+     "  if (u_semipass == 2 && stp == 0) discard;\n"
+     "  if (v_raw == 0) rgb = clamp(rgb * (v_cp != 0 ? v_col_p : v_col.rgb) * 2.0, 0.0, 1.0);\n"
+@@ -3220,6 +3252,10 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
+ static int s_wide_fast = 1;
+ void gl_renderer_set_wide_fast(int on) {
+     GL_RT_SYNC("set_wide_fast"); s_wide_fast = on ? 1 : 0; }
++void gl_renderer_set_wide_aux(int x, int y, int h) {
++    GL_RT_SYNC("set_wide_aux");
++    s_aux_x = x; s_aux_y0 = y; s_aux_y1 = y + h; s_aux_age = 1000;
++}
+ int  gl_renderer_get_wide_fast(void) { return s_wide_fast; }
+ 
+ /* PGXP renderer features (G1.14). Flags read at append time, so they can
+@@ -3450,6 +3486,7 @@ static void bind_textured_resources(GLuint source, GLuint palette, GLuint hd) {
+     p_glActiveTexture(PSXGL_TEXTURE0 + 2);
+     glBindTexture(GL_TEXTURE_2D, hd ? hd : s_up_tex); p_glUniform1i(s_uHdTexture, 2);
+     p_glActiveTexture(PSXGL_TEXTURE0);
++    p_glUniform1i(s_uAuxTex, 3);   /* never shares unit 0 with u_vram's usampler */
+ }
+ static int   s_tb_twin[4] = {0, 0, 0, 0};
+ static uint64_t s_batch_total = 0, s_batch_reason[8];
+@@ -3580,6 +3617,64 @@ static int mirror_batch_center_only(int nverts) {
+     return mirror_x_center_only((int)floorf(flo), (int)ceilf(fhi));
+ }
+ 
++
++/* ---- native-wide auxiliary layer (local patch) ----------------------------
++ * Some games draw part of the scene into a display-sized offscreen layer and
++ * paste it back over the display buffer with textured sprites (Vagrant
++ * Story's depth-of-field: the foreground characters go to 704,256 and come
++ * back as blurred 32x32 tiles). The layer has a wide surface of its own
++ * (gpu_ws_set_aux_target), but the tiles only cover the 4:3 frame. A batch
++ * that samples the layer is therefore drawn again into the display's reveal
++ * margins, shifted by whole display widths in both position and texel x, so
++ * the tile pattern continues; texels left or right of the layer's canonical
++ * columns come from its wide surface. */
++static int aux_batch_live(int nverts) {
++    if (s_aux_x < 0 || s_aux_age > 4 || !g_wide_cur || g_wide_cur_base == s_aux_x ||
++        g_wide_off <= 0 || s_tb_bank_tex || s_ws_ablate != 0) return 0;
++    int native_w = g_wide_w - 2 * g_wide_off;
++    if (native_w <= 0) return 0;
++    for (int i = 0; i < nverts; i++) {
++        const float *v = &s_tb[i * TEXV];
++        if (v[12] == 2.0f && v[25] == 0.0f &&
++            v[8] >= (float)s_aux_x && v[8] < (float)(s_aux_x + native_w) &&
++            v[9] + 255.0f >= (float)s_aux_y0 && v[9] < (float)s_aux_y1) return 1;
++    }
++    return 0;
++}
++/* The margin copies of a textured batch already bound for drawing into the
++ * current wide surface (vertex data uploaded, tex program in use); wdx is its
++ * plain mirror shift, [sy, sy+sh) its rows. Leaves u_xoff at wdx. */
++static void aux_copy_passes(int nverts, int semi, int mask, int check,
++                            int wdx, int sy, int sh) {
++    GLuint tex = 0;
++    for (int i = 0; i < WIDE_MAX_SURF; i++)
++        if (s_wide_fbo[i] && s_wide_base[i] == s_aux_x) tex = s_wide_tex[i];
++    int native_w = g_wide_w - 2 * g_wide_off, S = s_out_scale;
++    if (!tex || native_w <= 0 || sh <= 0) return;
++    p_glActiveTexture(PSXGL_TEXTURE0 + 3);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    p_glActiveTexture(PSXGL_TEXTURE0);
++    p_glUniform1i(s_uAuxTex, 3);
++    p_glUniform4i(s_uAuxRect, s_aux_x, s_aux_y0, s_aux_x + native_w, s_aux_y1);
++    p_glUniform4i(s_uAuxGeom, g_wide_off, g_wide_w, S, 0);
++    p_glUniform1i(s_uAux, 1);
++    glEnable(GL_SCISSOR_TEST);
++    for (int k = 1; (k - 1) * native_w < g_wide_off; k++) {
++        for (int side = -1; side <= 1; side += 2) {
++            int shift = side * k * native_w;
++            int x0 = side < 0 ? 0 : g_wide_off + native_w;
++            int x1 = side < 0 ? g_wide_off : g_wide_w;
++            glScissor(x0 * S, sy * S, (x1 - x0) * S, sh * S);
++            p_glUniform1f(s_tex_uXoff, (float)(wdx + shift));
++            p_glUniform1i(s_uAuxShift, shift);
++            tex_draw_passes_ex(nverts, semi, mask, check, 0);
++        }
++    }
++    p_glUniform1i(s_uAux, 0);
++    p_glUniform1i(s_uAuxShift, 0);
++    p_glUniform1f(s_tex_uXoff, (float)wdx);
++}
++
+ /* ---- windowed high-resolution surface: deferred mirror queue ------------
+  * Mirroring each batch into the window as it is flushed switches framebuffers
+  * twice per batch, and on Apple's GL (Metal underneath) every switch ends a
+@@ -3623,8 +3718,10 @@ typedef struct {
+     float   wscale, wcenter; /* its backdrop stretch (wide_bd_scale) */
+     int     wsx, wsy, wsw, wsh;  /* its wide-surface scissor (native px) */
+     uint8_t depth;           /* PGXP depth mode (depth_apply) */
++    uint8_t aux;             /* native-wide aux: 1 margin copies, 2 no plain mirror */
+ } HiCmd;
+ static int s_hq_depth_cur = 0;   /* depth mode of the batch being queued */
++static int s_hq_aux_cur = 0;     /* aux flags of the batch being queued */
+ static HiCmd  *s_hq = NULL;
+ static int     s_hq_n = 0, s_hq_cap = 0;
+ static float  *s_hq_v = NULL;
+@@ -3655,6 +3752,7 @@ static HiCmd *hiw_enqueue(int kind, const float *verts, int nverts, int stride)
+     s_hq_vn += nf;
+     c->check = (uint8_t)s_mask_check;
+     c->depth = (uint8_t)s_hq_depth_cur;
++    c->aux = (uint8_t)s_hq_aux_cur;
+     c->ax0 = s_area_x1; c->ay0 = s_area_y1; c->ax1 = s_area_x2; c->ay1 = s_area_y2;
+     s_hq_cmds++;
+     return c;
+@@ -3772,7 +3870,11 @@ static void hiw_replay_wide(void) {
+             p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
+                            s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+             depth_apply_ex(c->depth, 1);
+-            tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0);
++            if (!(c->aux & 2))
++                tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0);
++            if (c->aux & 1)
++                aux_copy_passes(c->vcount, c->semi, c->mask, c->check,
++                                c->wdx, c->wsy, c->wsh);
+             depth_restore_ex(c->depth, 1, c->vcount);
+         } else {
+             if (cur != HQ_GEO) {
+@@ -3928,27 +4030,40 @@ static void flush_tex_batch_impl(void) {
+      * frame, so it is never treated as centre-only. */
+     int mirror = g_wide_cur && s_ws_ablate != 1 &&
+                  !(s_tb_gate == 0 && mirror_batch_center_only(nverts));
++    int aux = aux_batch_live(nverts);   /* margin copies of an aux layer */
+     if (mirror) {   /* the stencil it may leave behind alpha */
+         float sc, ce;
+         wide_bd_scale(s_tb_gate, &sc, &ce);
+         wst_note_draw(g_wide_cur, s_tb, nverts, TEXV, wide_dx(), sc, ce, s_mask_check);
+     }
++    if (aux && !s_mask_check) {
++        int sy, sh;
++        wide_band_rows(&sy, &sh);
++        wst_add(wide_index(g_wide_cur), 0, sy, g_wide_w, sy + sh);
++    }
+     /* Windowed high-resolution surface: the same batch at S, queued and
+      * replayed in one render pass at the next sync point (see s_hq), with its
+      * native-wide mirror. No-op unless that mode is engaged. */
+     s_hq_depth_cur = dmode;
+-    if ((hiw_on() || (mirror && wide_queue_live())) &&
+-        hiw_enqueue_tex(nverts, semi, mirror, s_tb_gate)) mirror = 0;
++    s_hq_aux_cur = aux ? (1 | (mirror ? 0 : 2)) : 0;
++    if ((hiw_on() || ((mirror || aux) && wide_queue_live())) &&
++        hiw_enqueue_tex(nverts, semi, mirror || aux, s_tb_gate)) mirror = aux = 0;
+     s_hq_depth_cur = 0;
++    s_hq_aux_cur = 0;
+ 
+-    if (mirror) {   /* native-wide mirror */
++    if (mirror || aux) {   /* native-wide mirror */
+         int dx = wide_dx();
+         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
+         gl_perf_mirror_begin();
+         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+         depth_apply_ex(dmode, 1);
+-        if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
++        if (mirror && s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
++        if (aux) {
++            int sy, sh;
++            wide_band_rows(&sy, &sh);
++            aux_copy_passes(nverts, semi, s_tb_mask, s_mask_check, dx, sy, sh);
++        }
+         depth_restore_ex(dmode, 1, nverts);
+         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
+         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+@@ -5819,6 +5934,11 @@ static int init_gpu_raster(void) {
+     lod_apply_uniforms();
+     s_uLimits   = p_glGetUniformLocation(s_tex_prog, "u_limits");
+     s_uHdTexture = p_glGetUniformLocation(s_tex_prog, "u_hd_texture");
++    s_uAux      = p_glGetUniformLocation(s_tex_prog, "u_aux");
++    s_uAuxTex   = p_glGetUniformLocation(s_tex_prog, "u_aux_tex");
++    s_uAuxRect  = p_glGetUniformLocation(s_tex_prog, "u_aux_rect");
++    s_uAuxGeom  = p_glGetUniformLocation(s_tex_prog, "u_aux_geom");
++    s_uAuxShift = p_glGetUniformLocation(s_tex_prog, "u_aux_shift");
+     s_uBlitSrc     = p_glGetUniformLocation(s_blit_prog, "u_src");
+     s_uBlitPass    = p_glGetUniformLocation(s_blit_prog, "u_stp_pass");
+     s_uBlitMaskset = p_glGetUniformLocation(s_blit_prog, "u_maskset");
+@@ -6766,6 +6886,7 @@ static void glb_wide_set_target(int base_x) {
+     double t0 = cw_ms(); s_cw_wide_sets++;
+     flush_flat_batch();  /* drain into the OLD target before switching */
+     flush_tex_batch();
++    if (base_x == s_aux_x) s_aux_age = 0;
+     g_wide_cur = wide_fbo_for(base_x);
+     g_wide_cur_base = base_x;
+     s_cw_wide_ms += cw_ms() - t0;
+@@ -7091,6 +7212,7 @@ static void gl_perf_present_enter(void) {
+     /* PGXP depth (G1.14): every displayed frame starts with a clear depth
+      * buffer, whatever the game does with its drawing areas. */
+     if (s_depth_used) DEPTH_REQUEST_CLEAR(DCLR_PRESENT);
++    if (s_aux_age < 1000) s_aux_age++;   /* native-wide aux layer freshness */
+     /* Replay: taken on the emulation thread when the present was recorded. */
+     { extern void psx_ws_dbg_gate_frame_snapshot(void); if (!rth_replaying()) psx_ws_dbg_gate_frame_snapshot(); }
+     if (!s_pf_on || rthf_owns_timer()) return;
+-- 
+2.54.0.windows.1
+

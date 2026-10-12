@@ -1,0 +1,22 @@
+format_version = 5
+id = "vs.enhancement.skiplogos"
+version = "1.0.0"
+name = "Skippable Boot Logos"
+author = "VagrantStoryRecomp"
+description = "Press Enter, Circle or Start to skip the company logos shown at boot."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "skiplogos"
+name = "Skippable Boot Logos"
+description = "Enter, Circle or Start fades out the boot logos early."
+group = "Interface"
+default_enabled = true
+
+[[plugin]]
+feature = "skiplogos"
+id = "vs.skiplogos"

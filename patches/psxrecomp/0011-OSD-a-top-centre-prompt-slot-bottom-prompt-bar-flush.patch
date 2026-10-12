@@ -1,0 +1,154 @@
+From 7413860ba0ced4470492ef4228aa8bd27b86d89e Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 14:42:20 +0200
+Subject: [PATCH 11/13] OSD: a top-centre prompt slot; bottom prompt bar flush
+ with the edge
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/host_osd.h    |  3 +++
+ runtime/src/gpu_gl_renderer.c | 35 ++++++++++++++++++++++-------------
+ runtime/src/host_osd.c        |  8 ++++++++
+ 3 files changed, 33 insertions(+), 13 deletions(-)
+
+diff --git a/runtime/include/host_osd.h b/runtime/include/host_osd.h
+index 9c7f1af2..74447c18 100644
+--- a/runtime/include/host_osd.h
++++ b/runtime/include/host_osd.h
+@@ -47,6 +47,9 @@ void host_osd_present_done(void);
+ typedef int (*HostOsdPromptProvider)(const uint32_t **pixels, int *w, int *h);
+ void host_osd_set_prompt_provider(HostOsdPromptProvider provider);
+ int  host_osd_prompt_image(const uint32_t **pixels, int *w, int *h);
++/* The same for a top-centre bar (local patch). */
++void host_osd_set_top_provider(HostOsdPromptProvider provider);
++int  host_osd_top_image(const uint32_t **pixels, int *w, int *h);
+ 
+ /* Software / SDL_Renderer path: draw overlays over the current backbuffer. */
+ struct SDL_Renderer;
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 4c71c7ba..0b1989d3 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -9217,8 +9217,8 @@ static void present_image_ring_capture_gl(void) {
+  * at record time; replay draws that copy (ov_* below), never the live ones. */
+ static struct {
+     int valid, needs_present;
+-    const uint32_t *px[5];
+-    int w[5], h[5];
++    const uint32_t *px[6];
++    int w[6], h[6];
+     float slide;
+ } s_rth_ov;
+ static int ov_image(int i, const uint32_t **px, int *w, int *h) {
+@@ -9231,6 +9231,7 @@ static int ov_image(int i, const uint32_t **px, int *w, int *h) {
+     case 1: return host_osd_volume_image(px, w, h);
+     case 2: return psx_rewind_overlay_image(px, w, h);
+     case 4: return host_osd_prompt_image(px, w, h);   /* local patch */
++    case 5: return host_osd_top_image(px, w, h);      /* local patch */
+     default: return psx_savestate_menu_overlay_image(px, w, h);
+     }
+ }
+@@ -9507,16 +9508,24 @@ static void gl_swap_with_osd(void) {
+                 vy = wh - (int)((float)dh * slide + 0.5f);
+                 gl_draw_osd_image(px, ow, oh, dw, dh, 0, vy, ww, wh);
+             }
+-            /* Local patch: bottom-centre prompt bar, drawn under the
+-             * savestate menu so a full-screen menu still covers it. */
++            /* Local patch: game-owned prompt bars, centred on the bottom
++             * and top edges of the window, drawn under the savestate menu
++             * so a full-screen menu still covers them. */
+             if (ov_image(4, &px, &ow, &oh) && px) {
+                 const int dw = ow * ui, dh = oh * ui;
+                 const int bx = (ww > dw) ? (ww - dw) / 2 : 0;
+-                const int by = (wh > dh + margin) ? (wh - dh - margin) : 0;
++                const int by = (wh > dh) ? (wh - dh) : 0;
+                 s_osd_alpha_blend = 1;
+                 gl_draw_osd_image(px, ow, oh, dw, dh, bx, by, ww, wh);
+                 s_osd_alpha_blend = 0;
+             }
++            if (ov_image(5, &px, &ow, &oh) && px) {
++                const int dw = ow * ui, dh = oh * ui;
++                const int bx = (ww > dw) ? (ww - dw) / 2 : 0;
++                s_osd_alpha_blend = 1;
++                gl_draw_osd_image(px, ow, oh, dw, dh, bx, 0, ww, wh);
++                s_osd_alpha_blend = 0;
++            }
+             if (ov_image(3, &px, &ow, &oh) && px)
+                 gl_draw_osd_image(px, ow, oh, ww, wh, 0, 0, ww, wh);
+         }
+@@ -10851,18 +10860,18 @@ static int rth_record_mode(void) {
+ 
+ /* Present records carry the host overlays the emulation thread rasterized. */
+ typedef struct RthOvHdr {
+-    int32_t needs_present, has, w[5], h[5];
++    int32_t needs_present, has, w[6], h[6];
+     float   slide;
+     int32_t args[8], nargs;
+ } RthOvHdr;
+ 
+ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
+-    const uint32_t *px[5] = { NULL, NULL, NULL, NULL, NULL };
+-    int w[5] = { 0 }, h[5] = { 0 };
++    const uint32_t *px[6] = { NULL, NULL, NULL, NULL, NULL, NULL };
++    int w[6] = { 0 }, h[6] = { 0 };
+     RthOvHdr hd;
+     memset(&hd, 0, sizeof hd);
+     hd.needs_present = host_osd_needs_present();
+-    for (int i = 0; i < 5; i++) {
++    for (int i = 0; i < 6; i++) {
+         if (ov_image(i, &px[i], &w[i], &h[i]) && px[i] && w[i] > 0 && h[i] > 0) {
+             hd.has |= 1 << i; hd.w[i] = w[i]; hd.h[i] = h[i];
+         }
+@@ -10871,13 +10880,13 @@ static int rth_record_present(uint16_t op, int n, const int32_t *v) {
+     hd.nargs = n;
+     for (int i = 0; i < n && i < 8; i++) hd.args[i] = v[i];
+     size_t bytes = sizeof hd;
+-    for (int i = 0; i < 5; i++)
++    for (int i = 0; i < 6; i++)
+         if (hd.has & (1 << i)) bytes += (size_t)hd.w[i] * hd.h[i] * 4u;
+     uint8_t *p = (uint8_t *)rt_cmd_begin(op, 0, (uint32_t)bytes);
+     if (!p) return 0;
+     memcpy(p, &hd, sizeof hd);
+     uint8_t *q = p + sizeof hd;
+-    for (int i = 0; i < 5; i++)
++    for (int i = 0; i < 6; i++)
+         if (hd.has & (1 << i)) {
+             size_t n4 = (size_t)hd.w[i] * hd.h[i] * 4u;
+             memcpy(q, px[i], n4);
+@@ -10921,7 +10930,7 @@ static void rth_present_payload(uint16_t op, const uint8_t *p) {
+     s_rth_ov.valid = 1;
+     s_rth_ov.needs_present = hd.needs_present;
+     s_rth_ov.slide = hd.slide;
+-    for (int i = 0; i < 5; i++)
++    for (int i = 0; i < 6; i++)
+         if (hd.has & (1 << i)) {
+             s_rth_ov.px[i] = (const uint32_t *)q;
+             s_rth_ov.w[i] = hd.w[i];
+@@ -12756,7 +12765,7 @@ static void fg_generate_timed(double t) {
+         s_rth_ov.valid = 1;
+         s_rth_ov.needs_present = hd.needs_present;
+         s_rth_ov.slide = hd.slide;
+-        for (int i = 0; i < 5; i++)
++        for (int i = 0; i < 6; i++)
+             if (hd.has & (1 << i)) {
+                 s_rth_ov.px[i] = (const uint32_t *)qq;
+                 s_rth_ov.w[i] = hd.w[i]; s_rth_ov.h[i] = hd.h[i];
+diff --git a/runtime/src/host_osd.c b/runtime/src/host_osd.c
+index 29a884bb..c9a22a01 100644
+--- a/runtime/src/host_osd.c
++++ b/runtime/src/host_osd.c
+@@ -527,3 +527,11 @@ int host_osd_prompt_image(const uint32_t **pixels, int *w, int *h) {
+     if (!HOST_OSD_VISUAL || !s_prompt_provider) return 0;
+     return s_prompt_provider(pixels, w, h);
+ }
++static HostOsdPromptProvider s_top_provider = NULL;
++void host_osd_set_top_provider(HostOsdPromptProvider provider) {
++    s_top_provider = provider;
++}
++int host_osd_top_image(const uint32_t **pixels, int *w, int *h) {
++    if (!HOST_OSD_VISUAL || !s_top_provider) return 0;
++    return s_top_provider(pixels, w, h);
++}
+-- 
+2.54.0.windows.1
+

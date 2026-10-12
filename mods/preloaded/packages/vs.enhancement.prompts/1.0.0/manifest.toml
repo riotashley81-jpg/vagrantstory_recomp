@@ -1,0 +1,43 @@
+format_version = 5
+id = "vs.enhancement.prompts"
+version = "1.0.0"
+name = "Button Prompts"
+author = "VagrantStoryRecomp"
+description = "A small bar at the bottom of the screen listing what each button does right now, and one at the top listing the F-key shortcuts. Shows keyboard keys or controller buttons, whichever you used last. Either bar can be turned off."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "prompts"
+name = "Button Prompts"
+description = "Shows the current controls at the bottom of the screen and the F-key shortcuts at the top. Switches between keyboard and controller symbols automatically."
+group = "Interface"
+default_enabled = true
+
+[[option]]
+feature = "prompts"
+id = "controls_bar"
+label = "Show button bar (bottom)"
+type = "boolean"
+default = "true"
+
+[[option]]
+feature = "prompts"
+id = "hotkey_bar"
+label = "Show F-key bar (top)"
+type = "boolean"
+default = "true"
+
+[[option]]
+feature = "prompts"
+id = "game_icons"
+label = "Match the game's own button icons to your device"
+type = "boolean"
+default = "true"
+
+[[plugin]]
+feature = "prompts"
+id = "vs.prompts"

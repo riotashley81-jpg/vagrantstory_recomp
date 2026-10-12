@@ -1,0 +1,29 @@
+format_version = 5
+id = "vs.enhancement.stickcam"
+version = "1.0.0"
+name = "Right-Stick Camera"
+author = "VagrantStoryRecomp"
+description = "Push the right analog stick left or right to rotate the camera, in addition to L1/R1. Clicking the stick (R3) still switches to first-person view; there the right stick looks around and the left stick returns to the normal camera."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "stickcam"
+name = "Right-Stick Camera"
+description = "Right stick left/right turns the camera like R1/L1. In first-person view, push the left stick to return to the normal camera. Inactive in menus."
+group = "Controls"
+default_enabled = true
+
+[[option]]
+feature = "stickcam"
+id = "invert"
+label = "Invert direction"
+type = "boolean"
+default = "false"
+
+[[plugin]]
+feature = "stickcam"
+id = "vs.stickcam"

@@ -1,0 +1,147 @@
+From b809332aecc32577d9346a2140c8973a2e4b40c6 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 15:01:07 +0200
+Subject: [PATCH 12/13] Save-state menu and rewind bar: Xbox face-button
+ symbols
+
+A non-PlayStation pad (or PSX_PAD_STYLE=xbox) shows A/X/B in place of
+Cross/Square/Circle.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/psx_pad_style.h  | 35 ++++++++++++++++++++++++++++++++
+ runtime/src/psx_rewind.c         |  9 ++++++++
+ runtime/src/psx_savestate_menu.c | 24 ++++++++++++++++++++++
+ 3 files changed, 68 insertions(+)
+ create mode 100644 runtime/include/psx_pad_style.h
+
+diff --git a/runtime/include/psx_pad_style.h b/runtime/include/psx_pad_style.h
+new file mode 100644
+index 00000000..9184890e
+--- /dev/null
++++ b/runtime/include/psx_pad_style.h
+@@ -0,0 +1,35 @@
++#pragma once
++/* Which face-button symbols the host overlays draw (local patch): Xbox-style
++ * A/B/X/Y letters unless the first connected gamepad is a PlayStation pad.
++ * The runtime maps Cross/Circle/Square/Triangle to A/B/X/Y on other pads.
++ * PSX_PAD_STYLE=xbox|ps forces one (testing, or a preference). */
++#include "psx_sdl.h"
++#include <stdlib.h>
++
++static inline int psx_pad_style_xbox(void) {
++    const char *forced = getenv("PSX_PAD_STYLE");
++    if (forced && forced[0]) return forced[0] == 'x' || forced[0] == 'X';
++#if defined(PSX_SDL3)
++    int n = 0, xbox = 0;
++    SDL_JoystickID *ids = SDL_GetGamepads(&n);
++    for (int i = 0; ids && i < n; i++) {
++        SDL_Gamepad *g = SDL_GetGamepadFromID(ids[i]);
++        if (!g) continue;
++        switch (SDL_GetGamepadType(g)) {
++        case SDL_GAMEPAD_TYPE_PS3:
++        case SDL_GAMEPAD_TYPE_PS4:
++        case SDL_GAMEPAD_TYPE_PS5:
++            xbox = 0;
++            break;
++        default:
++            xbox = 1;
++            break;
++        }
++        break;
++    }
++    SDL_free(ids);
++    return xbox;
++#else
++    return 0;
++#endif
++}
+diff --git a/runtime/src/psx_rewind.c b/runtime/src/psx_rewind.c
+index e7be4598..2aa7104c 100644
+--- a/runtime/src/psx_rewind.c
++++ b/runtime/src/psx_rewind.c
+@@ -1,5 +1,6 @@
+ /* psx_rewind.c — local snap ring + filmstrip overlay. */
+ 
++#include "psx_pad_style.h"
+ #include "psx_rewind.h"
+ 
+ #include "boot_state.h"
+@@ -821,8 +822,16 @@ static void glyph_line(uint32_t *dst, int dw, int x0, int y0, int x1, int y1,
+     }
+ }
+ 
++static void draw_char(uint32_t *dst, int dw, int x0, int y0, char c, uint32_t col);
++
+ static void draw_psx_button(uint32_t *dst, int dw, int x, int y, char kind)
+ {
++    /* Local patch: A/B letters on a non-PlayStation pad. */
++    if ((kind == 'x' || kind == 'o') && psx_pad_style_xbox()) {
++        glyph_fill_disc(dst, dw, x + 9, y + 9, 8, kind == 'x' ? 0xFF4CB848u : 0xFFE0473Cu);
++        draw_char(dst, dw, x + 5, y + 5, kind == 'x' ? 'A' : 'B', 0xFF101218u);
++        return;
++    }
+     switch (kind) {
+     case 'x':
+         glyph_line(dst, dw, x + 4, y + 4, x + 14, y + 14, 2, 0xFF5FA8FFu);
+diff --git a/runtime/src/psx_savestate_menu.c b/runtime/src/psx_savestate_menu.c
+index 1004b944..0d708fa0 100644
+--- a/runtime/src/psx_savestate_menu.c
++++ b/runtime/src/psx_savestate_menu.c
+@@ -3,6 +3,7 @@
+ #include "psx_savestate_menu.h"
+ 
+ #include "host_keymap.h"
++#include "psx_pad_style.h"
+ #include "savestate.h"
+ 
+ #include <stdio.h>
+@@ -60,6 +61,7 @@ static int s_dirty = 1;
+ static uint32_t s_panel[SSM_W * SSM_H];
+ static uint32_t s_thumbs[SAVESTATE_SLOTS][SAVESTATE_THUMB_W * SAVESTATE_THUMB_H];
+ static int s_have_thumb[SAVESTATE_SLOTS];
++static int s_xbox = -1;   /* face-button symbols drawn: 1 Xbox, 0 PlayStation */
+ 
+ static void fill_rect(uint32_t *dst, int x0, int y0, int w, int h, uint32_t col)
+ {
+@@ -122,8 +124,26 @@ static void draw_line(uint32_t *dst, int x0, int y0, int x1, int y1,
+     }
+ }
+ 
++static void draw_char(uint32_t *dst, int x0, int y0, char c,
++                      uint32_t col, int scale);
++
++/* Xbox-style face button: a coloured disc with its letter. */
++static void draw_xbox_button(uint32_t *dst, int x, int y, char letter, uint32_t col)
++{
++    fill_disc(dst, x + 9, y + 9, 8, col);
++    draw_char(dst, x + 5, y + 5, letter, 0xFF101218u, 1);
++}
++
+ static void draw_psx_button(uint32_t *dst, int x, int y, char kind)
+ {
++    if (s_xbox > 0 && kind != 'd') {
++        switch (kind) {
++        case 'x': draw_xbox_button(dst, x, y, 'A', 0xFF4CB848u); return;
++        case 's': draw_xbox_button(dst, x, y, 'X', 0xFF3B7FE0u); return;
++        case 'o': draw_xbox_button(dst, x, y, 'B', 0xFFE0473Cu); return;
++        default: break;
++        }
++    }
+     switch (kind) {
+     case 'x':
+         draw_line(dst, x + 4, y + 4, x + 14, y + 14, 2, 0xFF5FA8FFu);
+@@ -317,6 +337,10 @@ int psx_savestate_menu_overlay_image(const uint32_t **pixels, int *w, int *h)
+         if (h) *h = 0;
+         return 0;
+     }
++    {
++        const int xbox = psx_pad_style_xbox();
++        if (xbox != s_xbox) { s_xbox = xbox; s_dirty = 1; }
++    }
+     if (s_dirty)
+         rasterize_panel();
+     if (pixels) *pixels = s_panel;
+-- 
+2.54.0.windows.1
+

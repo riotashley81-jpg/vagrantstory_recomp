@@ -1,0 +1,3 @@
+# Patches and shell scripts must keep LF endings (git am, bash).
+*.patch -text
+*.sh text eol=lf

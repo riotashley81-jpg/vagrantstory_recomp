@@ -1,0 +1,27 @@
+From dcd9f751e1c04b40b8fd980688a923783eda0d8b Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 10 Oct 2026 19:24:13 +0200
+Subject: [PATCH 03/13] Carry the prompt-bar overlay into generated (Smooth
+ motion) frames
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 3c8dd501..c1cafafa 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -12565,7 +12565,7 @@ static void fg_generate_timed(double t) {
+         s_rth_ov.valid = 1;
+         s_rth_ov.needs_present = hd.needs_present;
+         s_rth_ov.slide = hd.slide;
+-        for (int i = 0; i < 4; i++)
++        for (int i = 0; i < 5; i++)
+             if (hd.has & (1 << i)) {
+                 s_rth_ov.px[i] = (const uint32_t *)qq;
+                 s_rth_ov.w[i] = hd.w[i]; s_rth_ov.h[i] = hd.h[i];
+-- 
+2.54.0.windows.1
+

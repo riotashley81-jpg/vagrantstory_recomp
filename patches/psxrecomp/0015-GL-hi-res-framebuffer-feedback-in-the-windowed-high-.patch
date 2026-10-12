@@ -1,0 +1,103 @@
+From c70e4109b9783cfa8c1592c3fad23a3ef1d661e6 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 11 Oct 2026 22:13:48 +0200
+Subject: [PATCH 15/17] GL: hi-res framebuffer feedback in the windowed
+ high-resolution mode too
+
+Above the full-VRAM limit the displayed area lives in window tiles and the
+1x surface keeps the packed source, so the feedback copy comes from the tile
+holding the source and the queued sprite replays with it at once.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 0d36f298..2e3130e9 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3797,6 +3797,7 @@ typedef struct {
+     int     wsx, wsy, wsw, wsh;  /* its wide-surface scissor (native px) */
+     uint8_t depth;           /* PGXP depth mode (depth_apply) */
+     uint8_t aux;             /* native-wide aux: 1 margin copies, 2 no plain mirror, source << 2 */
++    uint8_t fb;              /* hi-res framebuffer feedback (fbfb_begin), window replay only */
+ } HiCmd;
+ static int s_hq_depth_cur = 0;   /* depth mode of the batch being queued */
+ static int s_hq_aux_cur = 0;     /* aux flags of the batch being queued */
+@@ -3831,6 +3832,7 @@ static HiCmd *hiw_enqueue(int kind, const float *verts, int nverts, int stride)
+     c->check = (uint8_t)s_mask_check;
+     c->depth = (uint8_t)s_hq_depth_cur;
+     c->aux = (uint8_t)s_hq_aux_cur;
++    c->fb = (uint8_t)(s_hiw && s_fbfb_live);
+     c->ax0 = s_area_x1; c->ay0 = s_area_y1; c->ax1 = s_area_x2; c->ay1 = s_area_y2;
+     s_hq_cmds++;
+     return c;
+@@ -4040,7 +4042,14 @@ static void hiw_flush_queue(void) {
+                 p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)((size_t)c->vcount * TEXV * sizeof(float)),
+                                s_hq_v + c->vfirst, PSXGL_STREAM_DRAW);
+                 depth_apply_ex(c->depth, 1);
++                if (c->fb) {
++                    p_glActiveTexture(PSXGL_TEXTURE0 + 4);
++                    glBindTexture(GL_TEXTURE_2D, s_fbfb_tex);
++                    p_glActiveTexture(PSXGL_TEXTURE0);
++                    p_glUniform1i(s_uFb, 1);
++                }
+                 tex_draw_passes_ex(c->vcount, c->semi, c->mask, c->check, 0);
++                if (c->fb) p_glUniform1i(s_uFb, 0);
+                 depth_restore_ex(c->depth, 1, c->vcount);
+             } else {
+                 if (cur != HQ_GEO) {
+@@ -4991,8 +5000,8 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+  * (Vagrant Story's depth-of-field tiles) keep the packed source, which their
+  * native-wide margins match. */
+ static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp) {
+-    const int S = s_hr_scale;
+-    if (S <= 1 || s_hiw || s_selected_bank_tex) return 0;
++    const int S = s_hiw ? s_out_scale : s_hr_scale;
++    if (S <= 1 || s_selected_bank_tex) return 0;
+     if (((tp >> 7) & 3) != 2) return 0;                  /* 15-bit page */
+     if (s_tw_mask_x | s_tw_mask_y) return 0;             /* no texture window */
+     if (u1 - u0 != w || v1 - v0 != h || u1 > 256 || v1 > 256) return 0;   /* 1:1 */
+@@ -5000,9 +5009,14 @@ static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp)
+     if (sx + w > VRAM_W || sy + h > VRAM_H) return 0;
+     if (sx > s_area_x2 || sx + w - 1 < s_area_x1 ||
+         sy > s_area_y2 || sy + h - 1 < s_area_y1) return 0;
++    /* Windowed surface: the 1x hr pass keeps the packed source; the window
++     * tile holding the source is what the replay reads. */
++    const HiwTile *T = NULL;
++    if (s_hiw && (!hiw_on() || !(T = hiw_tile_holding(sx, sx + w)))) return 0;
+     flush_cpu_upload();
+     flush_flat_batch();
+     flush_tex_batch();
++    if (T) hiw_flush_queue();   /* the tile, up to date */
+     int cw = w * S, ch = h * S;
+     if (!s_fbfb_tex || cw > s_fbfb_w || ch > s_fbfb_h) {
+         if (s_fbfb_tex) glDeleteTextures(1, &s_fbfb_tex);
+@@ -5012,19 +5026,20 @@ static int fbfb_begin(int w, int h, int u0, int v0, int u1, int v1, uint16_t tp)
+     }
+     p_glActiveTexture(PSXGL_TEXTURE0 + 4);
+     glBindTexture(GL_TEXTURE_2D, s_fbfb_tex);
+-    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sx * S, sy * S, cw, ch);
++    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, T ? T->fbo : s_hr_fbo);
++    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (sx - (T ? T->x0 : 0)) * S, sy * S, cw, ch);
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+     p_glActiveTexture(PSXGL_TEXTURE0);
+     p_glUseProgram(s_tex_prog);
+     p_glUniform4i(s_uFbOrg, sx * S, sy * S, S, 0);
+-    p_glUniform1i(s_uFb, 1);
++    p_glUniform1i(s_uFb, T ? 0 : 1);   /* windowed: per queued command */
+     p_glUseProgram(0);
+     s_fbfb_live = 1;
+     return 1;
+ }
+ static void fbfb_end(void) {
+     flush_tex_batch();
++    if (s_hiw) hiw_flush_queue();   /* replay it while the copy is current */
+     p_glUseProgram(s_tex_prog);
+     p_glUniform1i(s_uFb, 0);
+     p_glUseProgram(0);
+-- 
+2.54.0.windows.1
+
