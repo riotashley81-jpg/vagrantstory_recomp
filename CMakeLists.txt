@@ -35,7 +35,19 @@ if(NOT IS_DIRECTORY "${PSX_PRELOADED_MODS}")
     set(PSX_PRELOADED_MODS "NONE")
 endif()
 
+# Captured overlays (BATTLE.PRG and friends) compiled into the exe with this
+# compiler instead of TinyCC at runtime. Built from overlay_captures.json.d by
+# compile_overlays.py --static into generated/overlays/ (never committed). The
+# disc-code build must stay free of game code, so it never links them.
+set(VS_OVERLAY_STATIC_ARGS "")
+if(NOT PSXRECOMP_DISC_CODE AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/overlays/overlays_static.c")
+    set(VS_OVERLAY_STATIC_ARGS GAME_OVERLAY_STATIC_C
+        "${CMAKE_CURRENT_SOURCE_DIR}/generated/overlays/overlays_static.c")
+endif()
+
 psxrecomp_add_game_runtime(psx-runtime
+    ${VS_OVERLAY_STATIC_ARGS}
     PRELOADED_MODS_DIR "${PSX_PRELOADED_MODS}"
     # ENABLE_NETPLAY_IF_PRESENT
     # NETPLAY_LOBBY_URL "ws://netplay.retcomm.net:8765"
@@ -62,12 +74,27 @@ target_sources(psx-runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_stick_camera.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_skip_logos.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_glyphs.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_audio_session.c")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_audio_session.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_overlay_precompile.c")
+
+# Disc-code builds compile the overlays from the player's disc on first launch
+# (src/vs_overlay_precompile.c): stage the script and its address-only seed
+# list into the bundled overlay_toolchain/.
+if(PSXRECOMP_DISC_CODE)
+    add_custom_command(TARGET psx-runtime POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:psx-runtime>/overlay_toolchain"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/vs_overlay_precompile.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/aot/vs_overlay_seeds.json"
+            "$<TARGET_FILE_DIR:psx-runtime>/overlay_toolchain/"
+        COMMENT "Staging the overlay precompile script and seeds"
+        VERBATIM)
+endif()
 
 # Windows Volume Mixer: the game labels its audio session with the app icon
 # (src/vs_audio_session.c), read from assets/psxrecomp.ico next to the exe.
 if(WIN32)
-    target_link_libraries(psx-runtime PRIVATE ole32)
+    target_link_libraries(psx-runtime PRIVATE ole32 shell32)
     add_custom_command(TARGET psx-runtime POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:psx-runtime>/assets"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

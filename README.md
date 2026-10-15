@@ -15,8 +15,11 @@ on your machine only. That folder is ignored by git, so do not commit it.
 
 The [Releases](../../releases) page has a Windows build that also carries
 none of the game's code: it reads Vagrant Story's code from your disc when
-you play, runs it through psxrecomp's interpreter, and compiles the busy
-parts in the background with the bundled TinyCC (cached for next time).
+you play. On first launch it compiles the battle engine, menus and title
+screen from your disc in the background with a bundled gcc (low priority,
+battle code first; it can take an hour or more and is cached for good).
+Until then, and for anything else, it runs the code through psxrecomp's
+interpreter and TinyCC as before.
 
 1. Unzip it anywhere.
 2. Run `VagrantStory_Recompiled.exe` and point the launcher at your own
@@ -111,7 +114,13 @@ from an *x64 Native Tools* prompt with Git's `bin` folder ahead of WSL on
 To build the release variant with no game code inside, skip step 3 and
 configure with `-DPSXRECOMP_DISC_CODE=ON`. Copy the framework's
 `overlay_toolchain/` (TinyCC, the emitters and a pinned embeddable Python)
-next to the executable so it can compile from the disc at runtime.
+next to the executable so it can compile from the disc at runtime, and stage
+gcc into it from an extracted [w64devkit](https://github.com/skeeto/w64devkit)
+with `python tools/vs_stage_gcc.py --devkit <w64devkit> --toolchain
+<exe-dir>/overlay_toolchain --gpl3 <GPLv3 text>`. The first-launch compile
+reads `aot/vs_overlay_seeds.json`: disc file offsets, checksums and code
+addresses, no game bytes (`tools/vs_make_overlay_seeds.py` builds it from
+overlay captures).
 
 See `psxrecomp/docs/GAME_PROJECT_SETUP.md` for the framework's own build
 documentation.

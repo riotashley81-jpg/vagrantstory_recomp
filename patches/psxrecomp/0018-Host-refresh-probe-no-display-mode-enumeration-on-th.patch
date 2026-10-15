@@ -1,0 +1,108 @@
+From ac6482faad8b4fa686069b4edc837382ea6514c9 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Wed, 14 Oct 2026 23:40:47 +0200
+Subject: [PATCH 18/19] Host refresh probe: no display-mode enumeration on the
+ emulation thread
+
+SDL3's SDL_GetCurrentDisplayMode re-enumerates every fullscreen mode
+after any WM_DISPLAYCHANGE (0.3-2 s on multi-monitor PCs), and the
+once-a-second refresh probe ran it on the emulation thread, freezing
+the game and starving audio. Read the cached desktop/fullscreen mode
+instead, and enumerate for the VRR maximum only when VSync adaptive is
+on and the display or its refresh changes.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/psx_sdl.h | 30 +++++++++++++++++++++++++++++-
+ runtime/src/main.cpp      | 24 ++++++++++++++++++------
+ 2 files changed, 47 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/include/psx_sdl.h b/runtime/include/psx_sdl.h
+index 74a7cb6d..6ca26da4 100644
+--- a/runtime/include/psx_sdl.h
++++ b/runtime/include/psx_sdl.h
+@@ -137,8 +137,27 @@ static inline int psx_sdl_get_current_display_mode(
+     return 0;
+ }
+ 
++/* The refresh rate a window is presented at: its exclusive fullscreen mode
++ * when it has one, else the desktop mode of its display; 0 when unknown.
++ * Cheap enough to poll: SDL3's SDL_GetCurrentDisplayMode re-enumerates every
++ * fullscreen mode of the display (EnumDisplaySettings plus a DXGI factory per
++ * mode on Windows, 0.3-2 s on some multi-monitor PCs) whenever its mode list
++ * was reset, which every WM_DISPLAYCHANGE does. */
++static inline double psx_sdl_window_refresh_hz(SDL_Window *window,
++                                               SDL_DisplayID display)
++{
++    if (window && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)) {
++        const SDL_DisplayMode *fs = SDL_GetWindowFullscreenMode(window);
++        if (fs && fs->refresh_rate > 0.0f) return (double)fs->refresh_rate;
++    }
++    if (!display) display = SDL_GetPrimaryDisplay();
++    const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display);
++    return desktop ? (double)desktop->refresh_rate : 0.0;
++}
++
+ /* The highest refresh the display offers at the current mode's size (a VRR
+- * or ProMotion panel's maximum); 0 when unknown. */
++ * or ProMotion panel's maximum); 0 when unknown. Enumerates every display
++ * mode: call it when the display or its refresh changes, not per frame. */
+ static inline double psx_sdl_display_max_refresh(SDL_DisplayID display)
+ {
+     if (!display) display = SDL_GetPrimaryDisplay();
+@@ -288,6 +307,15 @@ static inline int psx_sdl_display_pixel_height(SDL_Window *window)
+     return mode.h;
+ }
+ 
++static inline double psx_sdl_window_refresh_hz(SDL_Window *window, int display)
++{
++    SDL_DisplayMode cur;
++    (void)window;
++    if (display < 0) display = 0;
++    if (SDL_GetCurrentDisplayMode(display, &cur) != 0) return 0.0;
++    return (double)cur.refresh_rate;
++}
++
+ static inline double psx_sdl_display_max_refresh(int display)
+ {
+     SDL_DisplayMode cur, m;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 278ea86a..c4a10836 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -3471,14 +3471,26 @@ static void refresh_host_display_cadence(int force_log, int force_probe) {
+     }
+     g_host_refresh_last_probe_ms = now_ms ? now_ms : 1ull;
+ 
++    /* This runs on the emulation thread once a second, so it reads only the
++     * cached desktop/fullscreen mode. The panel maximum needs every display
++     * mode enumerated (up to seconds on some PCs), is only used by VSync
++     * "adaptive" (2), and is only re-read when that mode is on and the
++     * display, its refresh or a forced probe asks for it. */
++    static double s_max_hz_cache = 0.0;
++    static int s_max_hz_display = -1;
++    static double s_max_hz_for_hz = 0.0;
+     double host_hz = 0.0, max_hz = 0.0;
+     if (disp_idx >= 0) {
+-        SDL_DisplayMode dm;
+-        if (SDL_GetCurrentDisplayMode(disp_idx, &dm) == 0 &&
+-            dm.refresh_rate > 0) {
+-            host_hz = (double)dm.refresh_rate;
+-            /* The panel's maximum refresh at this size (VRR targets it). */
+-            max_hz = psx_sdl_display_max_refresh(disp_idx);
++        host_hz = psx_sdl_window_refresh_hz(sdl_window, disp_idx);
++        if (host_hz > 0.0 && g_video_vsync == 2) {
++            if (force_probe || disp_idx != s_max_hz_display ||
++                std::fabs(host_hz - s_max_hz_for_hz) > 0.05) {
++                /* The panel's maximum refresh at this size (VRR targets it). */
++                s_max_hz_cache = psx_sdl_display_max_refresh(disp_idx);
++                s_max_hz_display = disp_idx;
++                s_max_hz_for_hz = host_hz;
++            }
++            max_hz = s_max_hz_cache;
+         }
+     }
+     /* Simulated displays (headless tests): PSX_HOST_REFRESH_HZ and
+-- 
+2.54.0.windows.1
+
