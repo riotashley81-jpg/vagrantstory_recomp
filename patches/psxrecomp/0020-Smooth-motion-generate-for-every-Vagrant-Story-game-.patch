@@ -1,0 +1,253 @@
+From b98ef30eedb8fe6b2ab9d8a1fb4ad8fd5db3f988 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 15 Oct 2026 19:50:20 +0200
+Subject: [PATCH] Smooth motion: generate for every Vagrant Story game frame
+
+While Ashley ran, only about a third of the game frames got in-between
+frames, so motion kept switching between smooth and 30 fps (about 45 of
+120 screen updates a second). Three causes:
+
+- An enabled but empty HD texture pack took GPU texture authority, and
+  every texture upload then stopped the render thread and restarted the
+  lists. HD authority now needs at least one replacement (or dumping).
+- Side-by-side display buffers (x = 0 / 320): redrawing the older frame
+  needs both in one column, so every game frame moving forward was
+  refused. Those redraw the newer frame instead.
+- The camera fit wanted half the pairs to agree; the followed character
+  is about half of them. Local Vagrant Story default 0.35.
+
+frame_gen now reports a per-game-frame outcome history ("hist") and the
+views of the last refused fit ("fail_views"). Slot 5 running, 120 Hz:
+113-119 updates a second; in-between frames step evenly from one real
+frame to the next. test_frame_gen passes.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/frame_gen.c         |  8 +++-
+ runtime/src/gpu_gl_renderer.c   | 75 +++++++++++++++++++++++++++++----
+ runtime/src/gpu_hd_textures.cpp | 20 ++++++++-
+ 3 files changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index a8c877f6..a0af0dee 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -40,7 +40,13 @@ uint32_t fg_hash(uint32_t h, const int32_t *w, int n) {
+ void fg_cam_defaults(FgCamParams *p) {
+     p->iters = 64;
+     p->tol_px = 1.0f;
+-    p->min_inliers = 0.5f;
++    /* Local patch (Vagrant Story): 0.5 refused most game frames while
++     * Ashley runs. The camera follows her, so her own model (about half the
++     * paired vertices, 46% measured) never agrees with the world's motion,
++     * and the world alone stayed just under half: generation then dropped to
++     * a third of the game frames and motion alternated between smooth and
++     * 30 fps. RANSAC still picks the largest consistent set. */
++    p->min_inliers = 0.35f;
+     p->min_pairs = 24;
+     p->max_angle = 0.35f;
+     p->max_shift = 0.5f;
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index b8c9033c..696d2ebf 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -11288,6 +11288,18 @@ static uint32_t fg_main_view(const FgCamFit *f) {
+ static int       s_fg_src_valid = 0; static int32_t s_fg_src[21];
+ static uint32_t  s_fg_src_seen = 0;
+ static uint64_t  s_fg_rejected = 0;           /* flips the verdict refused */
++/* Per game frame (always-on ring, TCP frame_gen "hist"): the in-between frames
++ * it showed (a digit), or why none: p room, b breaker, s stale, h held,
++ * l lists, i few inliers, c camera turned/moved, g through geometry,
++ * n no projections/pairs, G planned but none shown, ? other. Newest last. */
++#define FG_HIST_LEN 120
++static char      s_fg_hist[FG_HIST_LEN + 1];
++static int       s_fg_hist_len = 0;
++static char      s_fg_outcome = '?';
++static char      s_fg_gen_fail = 0;   /* why fg_generate drew nothing */
++static uint64_t  s_fg_gen_at_flip = 0;
++/* The last refused fit, per view: area size, pairs/inliers, verdict. */
++static char      s_fg_fail_views[384];
+ static const char *s_fg_reject_why = NULL;
+ static FgBreaker s_fg_brk;
+ static int       s_fg_brk_init = 0;
+@@ -12634,14 +12646,14 @@ static int rp_allocated(void) {
+ }
+ 
+ static int fg_generate(double t, int swap) {
+-    if (s_fg_pa < 0 || s_fg_pb < 0) return 0;
++    if (s_fg_pa < 0 || s_fg_pb < 0) { s_fg_gen_fail = 'x'; return 0; }
+     FgList *a = &s_fg_l[s_fg_pa], *b = &s_fg_l[s_fg_pb];
+-    if (!a->valid || !b->valid || s_hiw) return 0;
++    if (!a->valid || !b->valid || s_hiw) { s_fg_gen_fail = 'v'; return 0; }
+     /* A frame that reads itself back (a crossfade, fbfb_begin) has no
+      * in-between: its redraw would darken the newer frame's finished image
+      * again. The real frame is shown instead. */
+-    if (a->fbfb || b->fbfb) return 0;
+-    if (b->wide && (g_wide_w <= 0 || g_wide_w != b->wide_w)) return 0;
++    if (a->fbfb || b->fbfb) { s_fg_gen_fail = 'f'; return 0; }
++    if (b->wide && (g_wide_w <= 0 || g_wide_w != b->wide_w)) { s_fg_gen_fail = 'w'; return 0; }
+     int iw = -1;
+     if (b->wide) {
+         for (int i = 0; i < WIDE_MAX_SURF; i++)
+@@ -12689,7 +12701,13 @@ static int fg_generate(double t, int swap) {
+     const double tl = s_fg_src_older ? 1.0 - t : t;
+     const int ly = L->disp[1] < 0 ? 0 : L->disp[1];
+     const int lh = L->disp[1] + L->disp[3] > VRAM_H ? VRAM_H - ly : L->disp[1] + L->disp[3] - ly;
+-    if (L->disp[0] != b->disp[0] || lh != dh || L->disp[2] != b->disp[2]) return 0;
++    if (L->disp[0] != b->disp[0] || lh != dh || L->disp[2] != b->disp[2]) {
++        s_fg_gen_fail = 'd';
++        snprintf(s_fg_fail_views, sizeof s_fg_fail_views, "d L=%d,%d,%d,%d b=%d,%d,%d,%d lh=%d dh=%d older=%d",
++                 L->disp[0], L->disp[1], L->disp[2], L->disp[3], b->disp[0], b->disp[1], b->disp[2], b->disp[3],
++                 lh, dh, s_fg_src_older);
++        return 0;
++    }
+     /* Reprojected frames start from the list's snapshot instead (below). */
+     const int will_rp = s_fg_reproject && L == b && s_fg_fit.ok && rp_snap_slot((int)(L - s_fg_l)) >= 0;
+     if (!will_rp) {
+@@ -13051,6 +13069,21 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+     }
+     if (s_fg_pending) fg_flush();
+     s_fg_flips++;
++    {
++        const uint64_t g = atomic_load(&s_fg_generated);
++        const uint64_t shown = g - s_fg_gen_at_flip;
++        const char c = shown ? (char)('0' + (shown > 9 ? 9 : shown))
++            : (s_fg_outcome == 'G' && s_fg_gen_fail) ? s_fg_gen_fail : s_fg_outcome;
++        s_fg_gen_fail = 0;
++        if (s_fg_hist_len == FG_HIST_LEN) {
++            memmove(s_fg_hist, s_fg_hist + 1, FG_HIST_LEN - 1);
++            s_fg_hist_len--;
++        }
++        s_fg_hist[s_fg_hist_len++] = c;
++        s_fg_hist[s_fg_hist_len] = 0;
++        s_fg_gen_at_flip = g;
++        s_fg_outcome = '?';
++    }
+     {
+         const int vb = s_fg_have_last ? s_fg_vblanks : 1;
+         atomic_store(&s_fg_flip_vb, vb > 4 ? 4 : vb);
+@@ -13151,7 +13184,10 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+             else if (stale) s_fg_np_stale++;
+             else if (held) s_fg_np_held++;
+             else s_fg_np_room++;
++            s_fg_outcome = !fg_breaker_open(&s_fg_brk, now) ? 'b' : stale ? 's' : held ? 'h' : 'p';
+         }
++    } else {
++        s_fg_outcome = 'l';
+     }
+     s_fg_last_n = n;
+     if (n <= 0) return 0;
+@@ -13175,7 +13211,13 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+      * half of a split-screen view), so a third of the pairs is enough. */
+     if (s_fg_reproject) cp.min_inliers = 0.3f;
+     FgList *src = A;
+-    if (s_fg_reproject) {   /* the newer frame's image is warped: fit for it */
++    /* The older frame is redrawn in its own buffer and composed from there,
++     * with the edge strips copied from the newer image at the same columns:
++     * that needs both buffers in one column. Side-by-side buffers (Vagrant
++     * Story flips between x = 0 and x = 320) redraw the newer frame. */
++    const int older_ok = A->disp[0] == B->disp[0] && A->disp[2] == B->disp[2] &&
++                         A->disp[3] == B->disp[3];
++    if (s_fg_reproject || !older_ok) {   /* reprojection warps the newer frame's image */
+         src = B;
+         fg_cam_fit(&A->prims, &B->prims, &cp, &s_fg_fit, s_fg_verts);
+     } else if (!fg_cam_fit(&B->prims, &A->prims, &cp, &s_fg_fit, s_fg_verts) ||
+@@ -13215,6 +13257,22 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+     if (!s_fg_fit.ok && !s_fg_force) {
+         s_fg_rejected++;
+         s_fg_reject_why = s_fg_fit.why;
++        {
++            int o = 0;
++            s_fg_fail_views[0] = 0;
++            for (uint32_t vi = 0; vi < s_fg_fit.nviews && o < (int)sizeof s_fg_fail_views - 48; vi++) {
++                const FgView *v = &s_fg_fit.v[vi];
++                o += snprintf(s_fg_fail_views + o, sizeof s_fg_fail_views - (size_t)o,
++                              "%s%.0fx%.0f:%u/%u%s", vi ? " " : "",
++                              v->area[2] - v->area[0], v->area[3] - v->area[1],
++                              v->pairs, v->inliers, v->ok ? "" : "!");
++            }
++        }
++        {
++            const char *w = s_fg_fit.why ? s_fg_fit.why : "";
++            s_fg_outcome = strstr(w, "inliers") ? 'i' : strstr(w, "camera turned") || strstr(w, "camera moved") ? 'c'
++                : strstr(w, "geometry") ? 'g' : strstr(w, "projections") || strstr(w, "pairs") ? 'n' : '?';
++        }
+         s_fg_last_n = 0;
+         return 0;
+     }
+@@ -13241,6 +13299,7 @@ static int fg_on_present(uint16_t op, const uint8_t *p, uint32_t bytes, int stal
+     s_fg_step_ns = (uint64_t)(fg_step_s(flip_s, rhz, n) * 1e9);
+     if (s_fg_due < s_fg_t0 || s_fg_due > s_fg_t0 + s_fg_step_ns) s_fg_due = s_fg_t0;
+     s_fg_pending = 1;
++    s_fg_outcome = 'G';   /* planned; shown as a digit once its frames are drawn */
+     s_fg_bp_seen = bp;
+     uint64_t next = fg_tick(NULL, rt_now_ns());
+     if (next) rt_tick_at(next);
+@@ -13370,7 +13429,7 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
+     return snprintf(out, (size_t)cap,
+         "\"enabled\":%d,\"active\":%d,\"forced\":%d,\"generated\":%llu,\"real\":%llu,"
+         "\"flips\":%llu,\"dups\":%llu,\"flushed\":%llu,\"not_planned\":%llu,"
+-        "\"last_n\":%d,\"slots\":%d,\"flip_vblanks\":%d,\"refresh_hz\":%.1f,"
++        "\"hist\":\"%s\",\"fail_views\":\"%s\",\"last_n\":%d,\"slots\":%d,\"flip_vblanks\":%d,\"refresh_hz\":%.1f,"
+         "\"real_ms\":%.3f,\"gen_ms\":%.3f,\"gen_cpu_ms\":%.3f,\"gen_gpu_ms\":%.3f,\"swap_ms\":%.3f,"
+         "\"match_ms\":%.3f,"
+         "\"prims\":%u,\"views\":%u,\"pairs\":%u,\"inliers\":%u,\"src_triangles\":%u,"
+@@ -13386,7 +13445,7 @@ int gl_renderer_frame_gen_json(char *out, int cap) {
+         (unsigned long long)s_fg_generated, (unsigned long long)s_fg_real_presents,
+         (unsigned long long)s_fg_flips, (unsigned long long)s_fg_dups,
+         (unsigned long long)s_fg_flushed, (unsigned long long)s_fg_skipped_plan,
+-        s_fg_last_n, s_fg_last_slots, s_fg_flip_vb, atomic_load(&s_fg_refresh_hz),
++        s_fg_hist, s_fg_fail_views, s_fg_last_n, s_fg_last_slots, s_fg_flip_vb, atomic_load(&s_fg_refresh_hz),
+         s_fg_real_ema * 1e3, fg_cost()->ema * 1e3, s_fg_gen_cpu_ms, s_fg_gen_gpu_ms,
+         s_fg_swap_ema * 1e3,
+         s_fg_last_match_ms,
+diff --git a/runtime/src/gpu_hd_textures.cpp b/runtime/src/gpu_hd_textures.cpp
+index 7e75d48e..e23b320e 100644
+--- a/runtime/src/gpu_hd_textures.cpp
++++ b/runtime/src/gpu_hd_textures.cpp
+@@ -34,6 +34,11 @@ struct Session {
+     HdTexturePack* beetle = nullptr;
+     DuckTexturePack* duck = nullptr;
+     bool replacements = false;
++    /* The pack holds at least one replacement. An enabled but empty pack
++     * (the default folder before anything is installed) takes no GPU
++     * authority: under it every texture upload stops the render thread, and
++     * Smooth motion restarts each time (it then never generates). */
++    bool has_replacements = false;
+     bool dump = false;
+     bool dump_failed = false;
+     bool copy_pending = false;
+@@ -294,9 +299,20 @@ extern "C" int gpu_hd_textures_configure(const char* root, int replacements,
+                 next->learned = session->learned;
+             }
+         }
++        {
++            DuckTexturePackInfo next_info{};
++            duck_texture_pack_get_info(next->duck, &next_info);
++            size_t found = next_info.replacement_count;
++            if (next->beetle) {
++                HdTexturePackInfo beetle_info{};
++                hd_texture_pack_get_info(next->beetle, &beetle_info);
++                found = beetle_info.unique_key_count;
++            }
++            next->has_replacements = found > 0;
++        }
+         /* This also flushes all queued users before old replacement textures
+          * and pixel leases may be destroyed. */
+-        gl_renderer_set_hd_texture_mode(next->replacements || next->dump);
++        gl_renderer_set_hd_texture_mode((next->replacements && next->has_replacements) || next->dump);
+         gl_renderer_clear_hd_texture_cache();
+         session = std::move(next); ++generation;
+         DuckTexturePackInfo info{};
+@@ -339,7 +355,7 @@ extern "C" void gpu_hd_textures_set_dump_enabled(int enabled) {
+             session->dump_error = error; session->dump_failed = true; return;
+         }
+     }
+-    gl_renderer_set_hd_texture_mode(session->replacements || enabled);
++    gl_renderer_set_hd_texture_mode((session->replacements && session->has_replacements) || enabled);
+     session->dump = enabled != 0;
+     session->dump_failed = false;
+ }
+-- 
+2.54.0.windows.1
+
