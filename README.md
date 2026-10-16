@@ -54,11 +54,12 @@ launcher's Mods page:
 - The Windows Volume Mixer lists the game by name with its icon.
 - Keyboard default: Space is Jump.
 
-- **PGXP Precision** (psxrecomp's built-in mod, off by default): stops the
+- **PGXP Precision** (psxrecomp's built-in mod, on by default here through an
+  override in `mods/preloaded/packages/psx.enhancement.pgxp`): stops the
   PlayStation's polygon wobble and texture warping. Vertices keep their
   sub-pixel position and textures are drawn with perspective. The runtime is
-  built with the PGXP hooks (`VS_PGXP_HOOKS`, on), so it reaches about 97% of
-  the game's vertices; turn on its CPU-mode option for about 99%.
+  built with the PGXP hooks (`VS_PGXP_HOOKS`, on), and with the mod's
+  CPU-mode option (also on) it reaches about 99% of the game's vertices.
 
 Higher internal resolution, Smooth motion (frame generation) and the render
 thread come from psxrecomp and are set in the launcher's Display settings.
