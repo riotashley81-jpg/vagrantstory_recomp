@@ -51,6 +51,17 @@ internal_resolution = "display"
 render_thread = true
 frame_generation = true
 frame_generation_method = "redraw"
+# PGXP Precision mod (sub-pixel vertices + perspective textures; off until
+# the player enables it). The runtime is the PGXP hook flavor, so take the
+# full-coverage settings (docs/ENHANCEMENTS.md G1.11): no half-pixel clamp,
+# dataflow only. Not the exact projection: about 1% of Vagrant Story's
+# vertices project 4+ px from the GTE's integer result, so they flip between
+# the exact and the IR position from frame to frame (Ashley's head jumping
+# while she runs) and separately projected copies of a map corner split
+# apart (black slivers onto the void). The IR path stays within a pixel.
+pgxp_tolerance = -1.0
+pgxp_position_fallback = false
+pgxp_preserve_projection = false
 
 # Widescreen is offered by the vs.enhancement.widescreen mod (launcher Mods
 # page). These keep screen-space menus/HUD at their original proportions

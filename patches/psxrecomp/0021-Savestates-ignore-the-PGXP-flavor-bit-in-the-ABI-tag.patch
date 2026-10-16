@@ -1,0 +1,56 @@
+From c4584aafa14aac01a417534e0ca0f91afc96af43 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 15 Oct 2026 22:27:46 +0200
+Subject: [PATCH 21/25] Savestates: ignore the PGXP flavor bit in the ABI tag
+
+PGXP shadows are host-only and never saved, so the hook flavor's machine
+state matches the base flavor's. Masking the bit keeps existing
+savestates loadable when a title switches to the PGXP hook build.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/boot_state.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/boot_state.c b/runtime/src/boot_state.c
+index 33a850a1..2468eb91 100644
+--- a/runtime/src/boot_state.c
++++ b/runtime/src/boot_state.c
+@@ -3,6 +3,13 @@
+ #include "mod_memory.h"
+ #include "overlay_api.h"   /* PSX_OVERLAY_CODEGEN_HASH / _ABI_TAG / _CODEGEN_VER */
+ 
++/* The ABI tag a savestate carries. PGXP shadows are host-only and never
++ * saved (pgxp.h), so the PGXP hook flavor's machine state is the base
++ * flavor's: mask its flavor bit so turning the hook build on or off keeps
++ * every existing savestate loadable. */
++#define BOOT_STATE_ABI_TAG     ((int32_t)PSX_OVERLAY_ABI_TAG & ~(int32_t)(PSX_OVERLAY_FLAVOR_PGXP << 16))
++
++
+ /* Build-selected HLE may use private execution boundaries. Zero preserves
+  * the existing snapshot key for titles that do not select an implementation. */
+ #ifndef PSX_SAVESTATE_IMPL_TAG
+@@ -397,7 +404,7 @@ static int boot_state_save_to(BsOut* o, const CPUState* cpu,
+     h.bios_checksum = bios_checksum;
+     h.entry_pc      = entry_pc;
+     h.codegen_hash  = (uint32_t)PSX_OVERLAY_CODEGEN_HASH;
+-    h.abi_tag       = (int32_t)PSX_OVERLAY_ABI_TAG;
++    h.abi_tag       = BOOT_STATE_ABI_TAG;
+     h.codegen_ver   = BOOT_STATE_IMPLEMENTATION_KEY;
+     h.section_count = 17 + (psx_mod_memory_snapshot_bytes() ? 1u : 0u) +
+                       (psx_guest_cycle_scale_config() != 1u ? 1u : 0u);
+@@ -897,9 +904,9 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
+                  (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+         boot_state_append_reason(reason, reason_cap, part);
+     }
+-    if (h.abi_tag != (int32_t)PSX_OVERLAY_ABI_TAG) {
++    if (h.abi_tag != BOOT_STATE_ABI_TAG) {
+         snprintf(part, sizeof(part), "abi_tag=%d(want %d)",
+-                 (int)h.abi_tag, (int)PSX_OVERLAY_ABI_TAG);
++                 (int)h.abi_tag, (int)BOOT_STATE_ABI_TAG);
+         boot_state_append_reason(reason, reason_cap, part);
+     }
+     if (h.codegen_ver != BOOT_STATE_IMPLEMENTATION_KEY) {
+-- 
+2.54.0.windows.1
+

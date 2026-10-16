@@ -1,0 +1,79 @@
+From 9c7441a1636795a034f39c976f82080def61fc98 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Fri, 16 Oct 2026 20:18:45 +0200
+Subject: [PATCH 25/25] Smooth motion: cover the edges the in-between camera
+ uncovers
+
+In-between frames showed black bands down the screen sides in Vagrant
+Story whenever the camera turned or zoomed. Two causes: the native-wide
+surface's clears were replayed before anything was drawn (unlike
+RTH_FILL), blanking what the newer frame had there; and the edge strips
+copied from the newer frame were sized only from corners past the edge,
+missing polygons that end just inside it. Wide clears now follow the
+fill rule, and each strip is at least the world's furthest inward
+motion in that view.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/frame_gen.c       | 16 +++++++++++++++-
+ runtime/src/gpu_gl_renderer.c |  9 +++++++--
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index c84b069a..1b16bb24 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -736,12 +736,26 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 const int vi = verts[i].view;
+                 if (vi < 0 || verts[i].mode == FG_PLACE_UNCHANGED || isnan(dxs[i])) continue;
+                 const float *ar = fit->v[vi].area, bx = newer->v[j].x[k], by = newer->v[j].y[k];
+-                /* Geometry that reached past an edge now ends this far inside it. */
++                /* Geometry that reached past an edge now ends this far inside
++                 * it; and the world's furthest inward motion bounds how much
++                 * of an edge the in-between camera can uncover. The game
++                 * culls what lies wholly past its edges, so nothing there was
++                 * drawn: counting only corners past the edge missed polygons
++                 * that end just inside it, and the strip they left showed the
++                 * void behind -- in Vagrant Story a black band flickering down
++                 * the side of the screen in every in-between frame while the
++                 * camera turned or zoomed. */
+                 float m;
+                 if (bx <= ar[0] + 1.0f && (m = bx + dxs[i] - ar[0]) > margin[vi][0]) margin[vi][0] = m;
+                 if (by <= ar[1] + 1.0f && (m = by + dys[i] - ar[1]) > margin[vi][1]) margin[vi][1] = m;
+                 if (bx >= ar[2] - 1.0f && (m = ar[2] - (bx + dxs[i])) > margin[vi][2]) margin[vi][2] = m;
+                 if (by >= ar[3] - 1.0f && (m = ar[3] - (by + dys[i])) > margin[vi][3]) margin[vi][3] = m;
++                if (verts[i].mode == FG_PLACE_CAMERA) {
++                    if (dxs[i] > margin[vi][0]) margin[vi][0] = dxs[i];
++                    if (dys[i] > margin[vi][1]) margin[vi][1] = dys[i];
++                    if (-dxs[i] > margin[vi][2]) margin[vi][2] = -dxs[i];
++                    if (-dys[i] > margin[vi][3]) margin[vi][3] = -dys[i];
++                }
+             }
+     free(dxs); free(dys);
+ }
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 9b64c2dd..df7726f2 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -11996,11 +11996,16 @@ static void fg_replay(const FgList *a, const FgList *b, double t, GLuint gen_wid
+             g_wide_cur_base = v[0];
+             break;
+         case RTH_WIDE_DISABLE: glb_wide_disable_target(); break;
++        /* The wide surface's clears are frame clears like RTH_FILL's: before
++         * anything is drawn they are not redrawn, so what the in-between
++         * camera uncovers at the widened edges shows the newer frame instead
++         * of black (Vagrant Story: black wedges along the sides of every
++         * in-between frame while the camera turns or zooms). */
+         case RTH_WIDE_CLEAR:
+-            if (v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only) glb_wide_clear(v[0], v[1], v[2], (uint16_t)v[3]);
++            if (drawn && v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only) glb_wide_clear(v[0], v[1], v[2], (uint16_t)v[3]);
+             break;
+         case RTH_WIDE_CLEAR_MARGINS:
+-            if (v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only)
++            if (drawn && v[0] == disp[0] && gen_wide && !s_fg_replay_objects_only)
+                 glb_wide_clear_margins(v[0], v[1], v[2], (uint16_t)v[3], v[4]);
+             break;
+         case RTH_FILL:
+-- 
+2.54.0.windows.1
+

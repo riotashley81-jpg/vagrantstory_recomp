@@ -46,7 +46,18 @@ if(NOT PSXRECOMP_DISC_CODE AND
         "${CMAKE_CURRENT_SOURCE_DIR}/generated/overlays/overlays_static.c")
 endif()
 
+# PGXP hook flavor: the runtime tracks the GTE's sub-pixel projections through
+# the game's own register/memory copies so the PGXP Precision mod can draw
+# vertices off the integer grid and texture with perspective (no PS1 wobble).
+# Inert until the mod is enabled (Mods page / Settings).
+option(VS_PGXP_HOOKS "Build the runtime as the PGXP hook flavor" ON)
+set(VS_PGXP_ARGS "")
+if(VS_PGXP_HOOKS)
+    set(VS_PGXP_ARGS PGXP)
+endif()
+
 psxrecomp_add_game_runtime(psx-runtime
+    ${VS_PGXP_ARGS}
     ${VS_OVERLAY_STATIC_ARGS}
     PRELOADED_MODS_DIR "${PSX_PRELOADED_MODS}"
     # ENABLE_NETPLAY_IF_PRESENT

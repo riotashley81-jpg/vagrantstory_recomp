@@ -1,0 +1,159 @@
+From c2ac1aa5554e0868bad485c9e7090a0e8a9c4560 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Fri, 16 Oct 2026 00:11:54 +0200
+Subject: [PATCH 23/25] Smooth motion: weld PGXP vertices at their packet
+ position
+
+Generated frames weld every placed vertex at one screen position so
+separately projected copies of a corner move alike. Under PGXP the key
+was the sub-pixel position, and two copies of one corner (Vagrant
+Story's face mesh over its head) carry different fractions of the same
+integer vertex, so they no longer welded and the face slid off the head
+in every in-between frame. FgPrim now carries the packet position
+(wx/wy) and the weld and neighbour tables key on it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/frame_gen.h   |  3 +++
+ runtime/src/frame_gen.c       | 21 ++++++++++++++-------
+ runtime/src/gpu_gl_renderer.c | 34 +++++++++++++++++++++-------------
+ 3 files changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/runtime/include/frame_gen.h b/runtime/include/frame_gen.h
+index 587ed518..a774feb7 100644
+--- a/runtime/include/frame_gen.h
++++ b/runtime/include/frame_gen.h
+@@ -55,6 +55,9 @@ typedef struct FgPrim {
+     float    area[4];    /* that draw area (x1, y1, x2, y2), relative like x/y */
+     uint32_t vid[3];     /* projection identities, 0 = no projection */
+     float    x[3], y[3]; /* native px, relative to the list's display origin */
++    float    wx[3], wy[3]; /* where the packet put them (the integer vertices
++                            * under PGXP, else x/y): the key that welds
++                            * separately projected copies of one corner */
+     float    p[3][3];    /* camera-space positions (GTE units) */
+     float    h[3];       /* projection distance */
+ } FgPrim;
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index a0af0dee..0fa07bd7 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -22,7 +22,13 @@ int fg_prims_add(FgPrimList *l, const FgPrim *p) {
+         l->v = nv;
+         l->cap = nc;
+     }
+-    l->v[l->n++] = *p;
++    FgPrim *q = &l->v[l->n++];
++    *q = *p;
++    /* No packet position given (all zero): the drawn one is it. */
++    int none = 1;
++    for (int k = 0; k < 3; k++) none &= q->wx[k] == 0.0f && q->wy[k] == 0.0f;
++    if (none)
++        for (int k = 0; k < 3; k++) { q->wx[k] = q->x[k]; q->wy[k] = q->y[k]; }
+     return 1;
+ }
+ 
+@@ -578,7 +584,7 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 for (int k = 0; k < 3; k++) {
+                     if (verts[3 * j + k].mode != FG_PLACE_NEIGHBOUR || (done && done[3 * j + k])) continue;
+                     if (spread > 1.0f) guessed++;
+-                    const int32_t qx = (int32_t)lrintf(newer->v[j].x[k] * 16.0f), qy = (int32_t)lrintf(newer->v[j].y[k] * 16.0f);
++                    const int32_t qx = (int32_t)lrintf(newer->v[j].wx[k] * 16.0f), qy = (int32_t)lrintf(newer->v[j].wy[k] * 16.0f);
+                     uint32_t h = ((uint32_t)qx * 73856093u ^ (uint32_t)qy * 19349663u) & (cap - 1);
+                     while (tab[h].n && (tab[h].qx != qx || tab[h].qy != qy)) h = (h + 1) & (cap - 1);
+                     tab[h].qx = qx; tab[h].qy = qy;
+@@ -589,7 +595,7 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 for (int k = 0; k < 3; k++) {
+                     const uint32_t i = 3 * j + k;
+                     if (verts[i].mode != FG_PLACE_NEIGHBOUR || (done && done[i])) continue;
+-                    const int32_t qx = (int32_t)lrintf(newer->v[j].x[k] * 16.0f), qy = (int32_t)lrintf(newer->v[j].y[k] * 16.0f);
++                    const int32_t qx = (int32_t)lrintf(newer->v[j].wx[k] * 16.0f), qy = (int32_t)lrintf(newer->v[j].wy[k] * 16.0f);
+                     uint32_t h = ((uint32_t)qx * 73856093u ^ (uint32_t)qy * 19349663u) & (cap - 1);
+                     while (tab[h].n && (tab[h].qx != qx || tab[h].qy != qy)) h = (h + 1) & (cap - 1);
+                     if (tab[h].n) { dxs[i] = tab[h].dx / tab[h].n; dys[i] = tab[h].dy / tab[h].n; }
+@@ -597,8 +603,9 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+             free(tab);
+         }
+     }
+-    /* Weld: every placed vertex at one screen position (1/16 px) of one view
+-     * moves alike. The same corner reaches the GPU from several projections
++    /* Weld: every placed vertex at one screen position (1/16 px of where the
++     * packet put it, so PGXP's per-copy fractions do not split it) of one
++     * view moves alike. The same corner reaches the GPU from several projections
+      * (another function, another model vertex, an object and the world); if
+      * they moved apart, the shared edge would crack open onto whatever was
+      * drawn behind it (sky through a tunnel ceiling). */
+@@ -612,8 +619,8 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 slot[i] = UINT32_MAX;
+                 if (verts[i].mode == FG_PLACE_UNCHANGED) continue;
+                 const FgPrim *pr = &newer->v[i / 3];
+-                const int32_t qx = (int32_t)lrintf(pr->x[i % 3] * 16.0f) ^ (verts[i].view << 24);
+-                const int32_t qy = (int32_t)lrintf(pr->y[i % 3] * 16.0f);
++                const int32_t qx = (int32_t)lrintf(pr->wx[i % 3] * 16.0f) ^ (verts[i].view << 24);
++                const int32_t qy = (int32_t)lrintf(pr->wy[i % 3] * 16.0f);
+                 uint32_t h = ((uint32_t)qx * 73856093u ^ (uint32_t)qy * 19349663u) & (cap - 1);
+                 while (tab[h].n && (tab[h].qx != qx || tab[h].qy != qy)) h = (h + 1) & (cap - 1);
+                 tab[h].qx = qx; tab[h].qy = qy;
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index f022d7be..9b64c2dd 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -11243,7 +11243,7 @@ typedef struct {
+ } FgList;
+ static int rp_is_car(const FgList *L, uint32_t pi);
+ /* Raw triangle captured while recording a list (absolute coords). */
+-typedef struct { uint32_t rec, key0, vid[3]; float x[3], y[3], p[3][3], h[3]; int area[4]; } FgRaw;
++typedef struct { uint32_t rec, key0, vid[3]; float x[3], y[3], wx[3], wy[3], p[3][3], h[3]; int area[4]; } FgRaw;
+ 
+ static int       s_fg_on = 0;                 /* configured (any thread reads) */
+ static int       s_fg_force = 0;              /* PSX_FRAME_GEN_FORCE: tests */
+@@ -11669,19 +11669,24 @@ static void fg_capture(const RtCmd *c, const void *payload) {
+         /* The identities belong to this triangle only if it is drawn where
+          * they were looked up (a culled triangle leaves its record behind). */
+         for (int k = 0; k < 3; k++) raw.vid[k] = 0;
+-        if (s_fg_src_valid) {
+-            /* The sources were looked up at the packet's integer vertices.
+-             * A PGXP triangle draws at its sub-pixel positions, which under
+-             * preserve-projection can sit several pixels from those (near
+-             * geometry), so test where the packet put it: comparing the
+-             * precise position dropped the identities of some of a mesh's
+-             * triangles, their corners stayed put in generated frames while
+-             * their neighbours moved, and the shared edges cracked open. */
+-            float gx[3], gy[3];
++        /* Where the packet put the vertices. A PGXP triangle draws at its
++         * sub-pixel positions, which can sit several pixels from those (near
++         * geometry, preserve-projection), and two separately projected
++         * copies of one corner (a face over its head mesh) carry different
++         * fractions of the same integer vertex. */
++        {
+             uint32_t gkey;
+             if (!s_fg_pc_valid ||
+-                !fg_tri_geom(c->op, payload, NULL, gx, gy, &gkey))
+-                for (int k = 0; k < 3; k++) { gx[k] = raw.x[k]; gy[k] = raw.y[k]; }
++                !fg_tri_geom(c->op, payload, NULL, raw.wx, raw.wy, &gkey))
++                for (int k = 0; k < 3; k++) { raw.wx[k] = raw.x[k]; raw.wy[k] = raw.y[k]; }
++        }
++        if (s_fg_src_valid) {
++            /* The sources were looked up at the packet's integer vertices:
++             * comparing the precise position dropped the identities of some
++             * of a mesh's triangles, their corners stayed put in generated
++             * frames while their neighbours moved, and the shared edges
++             * cracked open. */
++            const float *gx = raw.wx, *gy = raw.wy;
+             int at = 1;
+             for (int k = 0; k < 3; k++)
+                 if (fabsf(gx[k] - (float)s_fg_src[3 + 2 * k]) > 1.5f ||
+@@ -11738,7 +11743,10 @@ static void fg_list_close(FgList *l, const int disp[4]) {
+             memcpy(p.p[k], r->p[k], sizeof p.p[k]);
+             p.h[k] = r->h[k];
+         }
+-        for (int k = 0; k < 3; k++) { p.x[k] = r->x[k] - (float)disp[0]; p.y[k] = r->y[k] - (float)disp[1]; }
++        for (int k = 0; k < 3; k++) {
++            p.x[k] = r->x[k] - (float)disp[0]; p.y[k] = r->y[k] - (float)disp[1];
++            p.wx[k] = r->wx[k] - (float)disp[0]; p.wy[k] = r->wy[k] - (float)disp[1];
++        }
+         if (!fg_prims_add(&l->prims, &p)) { l->valid = 0; return; }
+         l->rec2prim[r->rec] = (int32_t)(l->prims.n - 1);
+     }
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,167 @@
+From 7e92b03e78cea0b2b71129608f41a71ced86fa12 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Fri, 16 Oct 2026 12:40:47 +0200
+Subject: [PATCH 24/25] Smooth motion: lerp corners without a pairing from the
+ same triangle
+
+Generated frames placed a vertex whose identity the older frame lacks
+from its neighbours' or the camera's motion, and left projection-less
+triangles where the newer frame drew them. Vagrant Story rebuilds
+Ashley's head vertices every frame (new identities) and draws her face as
+a CPU-built overlay copying the head's SXY words (none), so in every
+in-between frame the face parted from the head and her chin jutted out.
+
+A triangle drawn with the same draw key in both frames (unique in each,
+same view, every corner within 48 px) is the same triangle: its corners
+without a pairing of their own now take the older triangle's corner and
+are lerped on screen (FG_PLACE_SCREEN). Offline check against real middle
+frames (fit r0 -> r2, place at t = 0.5, compare with r1): those corners'
+error drops from 2.1 to 1.0 px mean, the same as paired object vertices;
+frame_gen_test passes.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/frame_gen.h |  5 ++-
+ runtime/src/frame_gen.c     | 79 +++++++++++++++++++++++++++++++++++--
+ 2 files changed, 79 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/include/frame_gen.h b/runtime/include/frame_gen.h
+index a774feb7..83cb613c 100644
+--- a/runtime/include/frame_gen.h
++++ b/runtime/include/frame_gen.h
+@@ -116,8 +116,11 @@ typedef struct FgVert {
+     int8_t   view;           /* index into FgCamFit.v, -1 */
+     uint8_t  paired;         /* the older frame has this vertex */
+     float    a[3];           /* FG_PLACE_OBJECT: the older camera-space position */
++    float    o[2];           /* FG_PLACE_SCREEN: the older screen position */
+ } FgVert;
+-enum { FG_PLACE_UNCHANGED = 0, FG_PLACE_CAMERA, FG_PLACE_OBJECT, FG_PLACE_NEIGHBOUR };
++/* FG_PLACE_SCREEN: no usable pairing of its own, but its triangle is the
++ * older frame's triangle with the same draw key: lerped on screen. */
++enum { FG_PLACE_UNCHANGED = 0, FG_PLACE_CAMERA, FG_PLACE_OBJECT, FG_PLACE_NEIGHBOUR, FG_PLACE_SCREEN };
+ 
+ /* Fits the camera motion older -> newer per view and decides each newer
+  * vertex's placement; returns fit->ok (the verdict). */
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index 0fa07bd7..c84b069a 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -410,8 +410,74 @@ int fg_cam_fit(const FgPrimList *older, const FgPrimList *newer, const FgCamPara
+                 verts[3 * j + k].view = vw;
+             }
+     }
++    /* Triangles the game redraws with the same draw key (texture page, CLUT,
++     * UVs and op) in both frames are the same triangle. A corner without a
++     * pairing of its own takes the older triangle's corner and is lerped on
++     * screen: a mesh whose model-space vertices are rebuilt every frame has
++     * new identities each frame (Vagrant Story's Ashley: her head), and a
++     * CPU-built overlay has none (her face, copied onto the head) -- placed
++     * from their neighbours' or the camera's motion they parted from the
++     * rest of her in every in-between frame. Only keys unique in both
++     * frames, in one view, with every corner within 48 px. */
++    {
++        typedef struct { uint32_t key, view; int32_t idx; } KEnt;
++        uint32_t cap = 64;
++        while (cap < (older->n + 1u) * 2u) cap <<= 1;
++        KEnt *tab = (KEnt *)calloc(cap, sizeof *tab);
++        uint32_t cap2 = 64;
++        while (cap2 < (newer->n + 1u) * 2u) cap2 <<= 1;
++        KEnt *tn = (KEnt *)calloc(cap2, sizeof *tn);
++        if (tab && tn) {
++            /* idx: the triangle, -2 when the key repeats */
++            for (uint32_t j = 0; j < older->n; j++) {
++                const FgPrim *pr = &older->v[j];
++                uint32_t h = ((pr->key ^ (pr->view * 0x9E3779B9u)) * 2654435761u) & (cap - 1);
++                while (tab[h].idx && (tab[h].key != pr->key || tab[h].view != pr->view)) h = (h + 1) & (cap - 1);
++                if (!tab[h].idx) { tab[h].key = pr->key; tab[h].view = pr->view; tab[h].idx = (int32_t)j + 1; }
++                else tab[h].idx = -2;
++            }
++            for (uint32_t j = 0; j < newer->n; j++) {
++                const FgPrim *pr = &newer->v[j];
++                uint32_t h = ((pr->key ^ (pr->view * 0x9E3779B9u)) * 2654435761u) & (cap2 - 1);
++                while (tn[h].idx && (tn[h].key != pr->key || tn[h].view != pr->view)) h = (h + 1) & (cap2 - 1);
++                if (!tn[h].idx) { tn[h].key = pr->key; tn[h].view = pr->view; tn[h].idx = (int32_t)j + 1; }
++                else tn[h].idx = -2;
++            }
++            for (uint32_t j = 0; j < newer->n; j++) {
++                const FgPrim *pr = &newer->v[j];
++                int want = 0; int8_t vw = -1;
++                for (int k = 0; k < 3; k++) {
++                    const FgVert *fv = &verts[3 * j + k];
++                    if (fv->view >= 0) vw = fv->view;
++                    if (fv->mode == FG_PLACE_OBJECT || (fv->mode == FG_PLACE_CAMERA && fv->paired)) continue;
++                    want = 1;
++                }
++                if (!want) continue;
++                uint32_t h = ((pr->key ^ (pr->view * 0x9E3779B9u)) * 2654435761u) & (cap2 - 1);
++                while (tn[h].idx && (tn[h].key != pr->key || tn[h].view != pr->view)) h = (h + 1) & (cap2 - 1);
++                if (tn[h].idx < 0) continue;
++                h = ((pr->key ^ (pr->view * 0x9E3779B9u)) * 2654435761u) & (cap - 1);
++                while (tab[h].idx && (tab[h].key != pr->key || tab[h].view != pr->view)) h = (h + 1) & (cap - 1);
++                if (tab[h].idx <= 0) continue;
++                const FgPrim *po = &older->v[tab[h].idx - 1];
++                int near = 1;
++                for (int k = 0; k < 3; k++)
++                    if (fabsf(po->x[k] - pr->x[k]) > 48.0f || fabsf(po->y[k] - pr->y[k]) > 48.0f) near = 0;
++                if (!near) continue;
++                for (int k = 0; k < 3; k++) {
++                    FgVert *fv = &verts[3 * j + k];
++                    if (fv->mode == FG_PLACE_OBJECT || (fv->mode == FG_PLACE_CAMERA && fv->paired)) continue;
++                    fv->mode = FG_PLACE_SCREEN;
++                    fv->o[0] = po->x[k]; fv->o[1] = po->y[k];
++                    if (fv->view < 0) fv->view = vw;
++                }
++            }
++        }
++        free(tab); free(tn);
++    }
+     for (uint32_t j = 0; j < newer->n * 3u; j++)
+         switch (verts[j].mode) {
++        case FG_PLACE_SCREEN:
+         case FG_PLACE_CAMERA: fit->camera++; break;
+         case FG_PLACE_OBJECT: fit->object++; break;
+         case FG_PLACE_NEIGHBOUR: fit->neighbour++; break;
+@@ -464,6 +530,11 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+             const uint32_t i = 3 * j + k;
+             dxs[i] = dys[i] = 0.0f;
+             const FgVert *fv = &verts[i];
++            if (fv->mode == FG_PLACE_SCREEN) {
++                dxs[i] = (fv->o[0] - pr->x[k]) * (float)(1.0 - t);
++                dys[i] = (fv->o[1] - pr->y[k]) * (float)(1.0 - t);
++                continue;
++            }
+             if (fv->mode != FG_PLACE_CAMERA && fv->mode != FG_PLACE_OBJECT) continue;
+             const double pn[3] = { pr->p[k][0], pr->p[k][1], pr->p[k][2] };
+             double pt[3];
+@@ -525,8 +596,8 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                     for (int e = 0; e < 3; e++) {
+                         const uint32_t i0 = 3 * j + e, i1 = 3 * j + (e + 1) % 3;
+                         const uint8_t m0 = verts[i0].mode, m1 = verts[i1].mode;
+-                        if ((m0 != FG_PLACE_CAMERA && m0 != FG_PLACE_OBJECT) ||
+-                            (m1 != FG_PLACE_CAMERA && m1 != FG_PLACE_OBJECT)) continue;
++                        if ((m0 != FG_PLACE_CAMERA && m0 != FG_PLACE_OBJECT && m0 != FG_PLACE_SCREEN) ||
++                            (m1 != FG_PLACE_CAMERA && m1 != FG_PLACE_OBJECT && m1 != FG_PLACE_SCREEN)) continue;
+                         const float ax = pr->x[e], ay = pr->y[e], bx = pr->x[(e + 1) % 3], by = pr->y[(e + 1) % 3];
+                         const float ex = bx - ax, ey = by - ay, l2 = ex * ex + ey * ey;
+                         if (l2 < 1.0f) continue;
+@@ -566,7 +637,7 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 float sx = 0, sy = 0; int c = 0;
+                 for (int k = 0; k < 3; k++) {
+                     const uint8_t m = verts[3 * j + k].mode;
+-                    if ((m == FG_PLACE_CAMERA || m == FG_PLACE_OBJECT) && !isnan(dxs[3 * j + k])) {
++                    if ((m == FG_PLACE_CAMERA || m == FG_PLACE_OBJECT || m == FG_PLACE_SCREEN) && !isnan(dxs[3 * j + k])) {
+                         sx += dxs[3 * j + k]; sy += dys[3 * j + k]; c++;
+                     }
+                 }
+@@ -577,7 +648,7 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 float spread = 0;
+                 for (int k = 0; k < 3; k++) {
+                     const uint8_t m = verts[3 * j + k].mode;
+-                    if (m != FG_PLACE_CAMERA && m != FG_PLACE_OBJECT) continue;
++                    if (m != FG_PLACE_CAMERA && m != FG_PLACE_OBJECT && m != FG_PLACE_SCREEN) continue;
+                     const float ex = dxs[3 * j + k] - sx / c, ey = dys[3 * j + k] - sy / c;
+                     if (ex * ex + ey * ey > spread) spread = ex * ex + ey * ey;
+                 }
+-- 
+2.54.0.windows.1
+

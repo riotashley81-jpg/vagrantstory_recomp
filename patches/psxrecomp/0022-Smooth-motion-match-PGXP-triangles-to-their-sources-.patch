@@ -1,0 +1,50 @@
+From 8b30a92751c338748cd02a56ee17063bc4530722 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 15 Oct 2026 23:25:05 +0200
+Subject: [PATCH 22/25] Smooth motion: match PGXP triangles to their sources at
+ the packet position
+
+Generated frames checked a triangle's GTE sources against the position it
+draws at. Under PGXP preserve-projection that sub-pixel position can sit
+several pixels from the packet's integer vertices on near geometry, so some
+triangles of a close-up mesh lost their identities, stayed put while their
+neighbours moved, and every in-between frame showed dark cracks along the
+shared edges. Compare against the packet's integer vertices instead.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 696d2ebf..f022d7be 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -11670,10 +11670,22 @@ static void fg_capture(const RtCmd *c, const void *payload) {
+          * they were looked up (a culled triangle leaves its record behind). */
+         for (int k = 0; k < 3; k++) raw.vid[k] = 0;
+         if (s_fg_src_valid) {
++            /* The sources were looked up at the packet's integer vertices.
++             * A PGXP triangle draws at its sub-pixel positions, which under
++             * preserve-projection can sit several pixels from those (near
++             * geometry), so test where the packet put it: comparing the
++             * precise position dropped the identities of some of a mesh's
++             * triangles, their corners stayed put in generated frames while
++             * their neighbours moved, and the shared edges cracked open. */
++            float gx[3], gy[3];
++            uint32_t gkey;
++            if (!s_fg_pc_valid ||
++                !fg_tri_geom(c->op, payload, NULL, gx, gy, &gkey))
++                for (int k = 0; k < 3; k++) { gx[k] = raw.x[k]; gy[k] = raw.y[k]; }
+             int at = 1;
+             for (int k = 0; k < 3; k++)
+-                if (fabsf(raw.x[k] - (float)s_fg_src[3 + 2 * k]) > 1.5f ||
+-                    fabsf(raw.y[k] - (float)s_fg_src[4 + 2 * k]) > 1.5f) at = 0;
++                if (fabsf(gx[k] - (float)s_fg_src[3 + 2 * k]) > 1.5f ||
++                    fabsf(gy[k] - (float)s_fg_src[4 + 2 * k]) > 1.5f) at = 0;
+             if (at) for (int k = 0; k < 3; k++) {
+                 raw.vid[k] = (uint32_t)s_fg_src[k];
+                 for (int c = 0; c < 3; c++) raw.p[k][c] = (float)s_fg_src[9 + 3 * k + c];
+-- 
+2.54.0.windows.1
+
