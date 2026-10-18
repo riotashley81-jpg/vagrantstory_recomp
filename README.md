@@ -118,6 +118,11 @@ from an *x64 Native Tools* prompt with Git's `bin` folder ahead of WSL on
 5. Run `build/VagrantStory_Recompiled.exe` and point the launcher at your
    `.cue`. Saves and memory cards go where you set them in the launcher.
 
+`build_release.bat` (or `pwsh build_release.ps1`) does step 4 in one go
+after the patches are applied: it loads the VS 2022 environment, builds
+`build-release/` and stages a runnable copy in `dist/release/`. Pass
+`-DiscCode` for the variant below, `-Clean` for a from-scratch build.
+
 To build the release variant with no game code inside, skip step 3 and
 configure with `-DPSXRECOMP_DISC_CODE=ON`. Copy the framework's
 `overlay_toolchain/` (TinyCC, the emitters and a pinned embeddable Python)

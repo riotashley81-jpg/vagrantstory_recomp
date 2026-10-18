@@ -46,6 +46,12 @@ static void vs_widescreen_activate(void) {
      * VRAM 0 or 320) over the new one with sprites; read its margins too. */
     gl_renderer_set_wide_aux(0, 0, 224, 0);
     gl_renderer_set_wide_aux(320, 0, 224, 0);
+    /* The opening's staff credit cards black out the screen with a grid of
+     * 64x15 black tiles; widen the edge tiles so the card fills the frame. */
+    gpu_ws_set_black_edge_rects(1);
+    /* Each card wipes in and out one scanline at a time; stretch the wipe
+     * across the wide frame too. */
+    gpu_ws_set_row_wipe(1);
 
     fprintf(stdout, "vagrantstory: widescreen %s (HUD %s)\n",
             aspect[0] ? aspect : "16:9", hud[0] ? hud : "original");
