@@ -1,0 +1,490 @@
+From 2384c8fd43def9bad86462a96620b5b8ad862ab5 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 17 Oct 2026 18:42:05 +0200
+Subject: [PATCH 28/33] PGXP: cheaper per-instruction hooks
+
+The ALU hook runs after every guest ALU instruction (about 7 million a
+second in Vagrant Story's opening cutscene), and in cpu-mode it always ran
+both tiers through several out-of-line helpers. In that cutscene the
+emulation thread already sits near its frame budget, and the hooks pushed
+heavy stretches over it: slowdown and audio underruns.
+
+- ALU ops whose operands carry no shadow flag and no scalar, and the ops
+  neither tier tracks (SLT, SLTI, ...), reset the destination directly;
+  that is exactly what the two tiers produced for them.
+- The scalar tier runs only when an operand could be precise.
+- The small per-hook helpers are force-inlined (MSVC left pv_validate,
+  gpr_scalar and others out of line); the render-pass journal keeps only
+  its depth check inline.
+- Source shadows are copied only when the destination aliases them.
+
+Shadow results are unchanged: a randomized differential driver feeding
+the old and new engine the same MIPS-consistent load/store/ALU/muldiv/
+COP2 stream (4.8M steps, cpu-mode on and off) ends in identical state,
+and test_pgxp passes. Cutscene benchmark (frames 120-2400 from the same
+savestate, 3 rounds): emulation-thread cycles 130.7 -> 124.9 G; cpu-mode
+off is 115.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/pgxp.cpp | 232 ++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 172 insertions(+), 60 deletions(-)
+
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index b37936fd..1a97a6c8 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -66,6 +66,15 @@ enum {
+     PGXP_F_VXY = PGXP_F_VX | PGXP_F_VY,
+ };
+ 
++/* The hooks run once per guest load / store / ALU instruction; MSVC's
++ * heuristics leave several of these helpers out of line, which costs more
++ * than the work they do. */
++#if defined(_MSC_VER)
++#define PGXP_HOT static __forceinline
++#else
++#define PGXP_HOT static inline __attribute__((always_inline))
++#endif
++
+ struct PGXPValue {
+     int32_t  x16, y16;   /* sub-pixel screen coords, 16.16                    */
+     uint16_t z;          /* projected SZ depth (perspective source), 0 = none */
+@@ -327,7 +336,7 @@ extern "C" uint64_t pgxp_store_ring(const PGXPStoreRecord **ring, uint32_t *cap)
+ /* Guest address -> shadow slot, or NULL for BIOS/MMIO/KSEG2 (untrackable).
+  * Unallocated mod-region addresses map too: nothing stores there, and every
+  * consumer validates the shadow against the actual guest word. */
+-static inline PGXPValue *pgxp_ptr(uint32_t addr) {
++PGXP_HOT PGXPValue *pgxp_ptr(uint32_t addr) {
+     uint32_t m = addr & 0x1FFFFFFFu;
+     if (m < PSX_MAIN_RAM_WINDOW_BYTES)         /* RAM + its mirrors (live map) */
+         return s_ram ? &s_ram[psx_ram_canonical_offset(m) >> 2] : nullptr;
+@@ -378,8 +387,7 @@ static inline size_t ck_index(const PGXPValue *pv) {
+ }
+ 
+ /* Journal a RAM / scratchpad slot before its first mutation in a pass. */
+-static inline void ck_note(PGXPValue *pv) {
+-    if (s_ck_depth == 0 || !pv) return;
++static void ck_note_slow(PGXPValue *pv) {
+     if (s_ram != s_ck_ram && !(pv >= s_scratch &&
+                                pv < s_scratch + PGXP_SCRATCH_WORDS)) {
+         s_ck_lossy = 1;                        /* shadow RAM appeared mid-pass */
+@@ -402,13 +410,17 @@ static inline void ck_note(PGXPValue *pv) {
+     s_ck_n++;
+ }
+ 
++PGXP_HOT void ck_note(PGXPValue *pv) {
++    if (s_ck_depth != 0 && pv) ck_note_slow(pv);
++}
++
+ static void ck_wrapped(void) {
+     if (s_ck_depth != 0) s_ck_lossy = 1;       /* shadows were cleared        */
+ }
+ 
+ static int ck_in_pass(void) { return s_ck_depth != 0; }
+ 
+-static inline PGXPValue *pgxp_ptr_w(uint32_t addr) {
++PGXP_HOT PGXPValue *pgxp_ptr_w(uint32_t addr) {
+     PGXPValue *pv = pgxp_ptr(addr);
+     ck_note(pv);
+     return pv;
+@@ -462,13 +474,13 @@ extern "C" void pgxp_checkpoint_rollback(void) {
+     }
+ }
+ 
+-static inline int pv_live(const PGXPValue *pv) {
++PGXP_HOT int pv_live(const PGXPValue *pv) {
+     return pv && pv->gen == s_gen && (pv->flags & PGXP_F_VXY) != 0;
+ }
+ 
+ /* Drop whichever tracked halves no longer match the actual guest word; the
+  * depth belongs to the whole vertex, so any half going stale kills it too. */
+-static inline void pv_validate(PGXPValue *pv, uint32_t actual) {
++PGXP_HOT void pv_validate(PGXPValue *pv, uint32_t actual) {
+     if (pv->gen != s_gen) return;
+     uint32_t diff = pv->value ^ actual;
+     if (diff) pv->flags &= (uint16_t)~PGXP_F_PROJECTION;
+@@ -481,14 +493,14 @@ static inline void pv_validate(PGXPValue *pv, uint32_t actual) {
+ 
+ /* Mark a slot as "known word, no precision" — keeps `value` current so later
+  * half-merges stay keyed correctly. */
+-static inline void pv_reset(PGXPValue *pv, uint32_t value) {
++PGXP_HOT void pv_reset(PGXPValue *pv, uint32_t value) {
+     pv->x16 = 0; pv->y16 = 0; pv->z = 0;
+     pv->flags = 0;
+     pv->value = value;
+     pv->gen = s_gen;
+ }
+ 
+-static inline void pv_kill(PGXPValue *pv) { pv->gen = 0; }
++PGXP_HOT void pv_kill(PGXPValue *pv) { pv->gen = 0; }
+ 
+ extern "C" void pgxp_invalidate_word(uint32_t addr) {
+     if (!g_pgxp_active) return;
+@@ -500,33 +512,33 @@ extern "C" void pgxp_invalidate_word(uint32_t addr) {
+ /* Instruction field helpers                                                  */
+ /* ------------------------------------------------------------------------- */
+ 
+-static inline uint32_t f_op(uint32_t i)    { return i >> 26; }
+-static inline uint32_t f_rs(uint32_t i)    { return (i >> 21) & 31u; }
+-static inline uint32_t f_rt(uint32_t i)    { return (i >> 16) & 31u; }
+-static inline uint32_t f_rd(uint32_t i)    { return (i >> 11) & 31u; }
+-static inline uint32_t f_shamt(uint32_t i) { return (i >> 6) & 31u; }
+-static inline uint32_t f_funct(uint32_t i) { return i & 63u; }
+-static inline int32_t  f_simm(uint32_t i)  { return (int32_t)(int16_t)(i & 0xFFFFu); }
++PGXP_HOT uint32_t f_op(uint32_t i)    { return i >> 26; }
++PGXP_HOT uint32_t f_rs(uint32_t i)    { return (i >> 21) & 31u; }
++PGXP_HOT uint32_t f_rt(uint32_t i)    { return (i >> 16) & 31u; }
++PGXP_HOT uint32_t f_rd(uint32_t i)    { return (i >> 11) & 31u; }
++PGXP_HOT uint32_t f_shamt(uint32_t i) { return (i >> 6) & 31u; }
++PGXP_HOT uint32_t f_funct(uint32_t i) { return i & 63u; }
++PGXP_HOT int32_t  f_simm(uint32_t i)  { return (int32_t)(int16_t)(i & 0xFFFFu); }
+ 
+ /* ------------------------------------------------------------------------- */
+ /* Scalar tier helpers                                                        */
+ /* ------------------------------------------------------------------------- */
+ 
+-static inline void sc_kill(PGXPScalar *s) { s->gen = 0; }
+-static inline void sc_set(PGXPScalar *s, double v, uint32_t value) {
++PGXP_HOT void sc_kill(PGXPScalar *s) { s->gen = 0; }
++PGXP_HOT void sc_set(PGXPScalar *s, double v, uint32_t value) {
+     s->v = v; s->value = value; s->gen = s_gen;
+ }
+-static inline int sc_valid(const PGXPScalar *s, uint32_t value) {
++PGXP_HOT int sc_valid(const PGXPScalar *s, uint32_t value) {
+     return s->gen == s_gen && s->value == value;
+ }
+ 
+ /* A GPR write that produces no scalar ends whatever scalar the register had. */
+-static inline void gpr_written(uint32_t r) { if (r != 0) sc_kill(&s_gpr_s[r]); }
++PGXP_HOT void gpr_written(uint32_t r) { if (r != 0) sc_kill(&s_gpr_s[r]); }
+ 
+ /* A register holding one 16-bit half, sign- or zero-extended (LH / LHU, or an
+  * MTC2 / CTC2 of such a register), whose half shadow is tracked: its precise
+  * value as a number. */
+-static inline int half_scalar(const PGXPValue *pv, uint32_t value, double *out) {
++PGXP_HOT int half_scalar(const PGXPValue *pv, uint32_t value, double *out) {
+     if (!pv || pv->gen != s_gen || pv->value != value) return 0;
+     if ((pv->flags & PGXP_F_VXY) != PGXP_F_VXY) return 0;
+     const int32_t sx = (int32_t)(int16_t)(value & 0xFFFFu);
+@@ -541,7 +553,7 @@ static inline int half_scalar(const PGXPValue *pv, uint32_t value, double *out)
+ 
+ /* The precise value of a register: its scalar, else its half shadow as a
+  * number, else the exact integer (*precise = 0). */
+-static inline double reg_scalar(const PGXPScalar *s, const PGXPValue *pv,
++PGXP_HOT double reg_scalar(const PGXPScalar *s, const PGXPValue *pv,
+                                 uint32_t value, int is_unsigned, int *precise) {
+     double v;
+     if (s && sc_valid(s, value)) { *precise = 1; return s->v; }
+@@ -550,7 +562,7 @@ static inline double reg_scalar(const PGXPScalar *s, const PGXPValue *pv,
+     return is_unsigned ? (double)value : (double)(int32_t)value;
+ }
+ 
+-static inline double gpr_scalar(uint32_t r, uint32_t value, int is_unsigned,
++PGXP_HOT double gpr_scalar(uint32_t r, uint32_t value, int is_unsigned,
+                                 int *precise) {
+     if (r == 0) { *precise = 0; return 0.0; }
+     return reg_scalar(&s_gpr_s[r], &s_gpr[r], value, is_unsigned, precise);
+@@ -856,7 +868,7 @@ extern "C" void psx_pgxp_cop2(struct CPUState *cpu, uint32_t instr,
+ /* One 16-bit operand component in 16.16: a tracked half contributes its
+  * sub-pixel value; an untracked half contributes its exact integer value
+  * (adding an exact offset to a tracked coordinate keeps the fraction). */
+-static inline int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
++PGXP_HOT int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
+     if (pv && pv->gen == s_gen) {
+         if (!hi_half && (pv->flags & PGXP_F_VX) &&
+             ((pv->value ^ value) & 0x0000FFFFu) == 0)
+@@ -870,7 +882,7 @@ static inline int32_t comp16(const PGXPValue *pv, uint32_t value, int hi_half) {
+ 
+ /* The derived-half marks (PGXP_F_DX / DY) an operand contributes through
+  * comp16: a tracked derived half keeps its rounding window in the sum. */
+-static inline uint16_t derived_bits(const PGXPValue *pv, uint32_t value) {
++PGXP_HOT uint16_t derived_bits(const PGXPValue *pv, uint32_t value) {
+     if (!pv || pv->gen != s_gen) return 0;
+     uint16_t d = 0;
+     if ((pv->flags & PGXP_F_DX) && (pv->flags & PGXP_F_VX) &&
+@@ -880,7 +892,7 @@ static inline uint16_t derived_bits(const PGXPValue *pv, uint32_t value) {
+     return d;
+ }
+ 
+-static inline int comp_tracked(const PGXPValue *pv, uint32_t value, int hi_half) {
++PGXP_HOT int comp_tracked(const PGXPValue *pv, uint32_t value, int hi_half) {
+     if (!pv || pv->gen != s_gen) return 0;
+     if (!hi_half)
+         return (pv->flags & PGXP_F_VX) &&
+@@ -892,7 +904,7 @@ static inline int comp_tracked(const PGXPValue *pv, uint32_t value, int hi_half)
+ /* Half-wise add/sub is only meaningful when the guest result shows no carry
+  * crossed the half boundary; otherwise the halves did not combine
+  * independently and the shadow must not pretend they did. */
+-static inline int halves_independent(uint32_t a, uint32_t b, uint32_t r, int sub) {
++PGXP_HOT int halves_independent(uint32_t a, uint32_t b, uint32_t r, int sub) {
+     uint32_t lo = sub ? ((a & 0xFFFFu) - (b & 0xFFFFu))
+                       : ((a & 0xFFFFu) + (b & 0xFFFFu));
+     return ((lo ^ r) & 0xFFFFu) == 0 &&
+@@ -910,7 +922,7 @@ static inline int halves_independent(uint32_t a, uint32_t b, uint32_t r, int sub
+  * in both tiers. The carried value keeps the shadow invariant (integer part
+  * == the half read as int16): the fraction rides along, the integer becomes
+  * the result half. The GPU consumer rebases onto the field it decodes. */
+-static inline int half_exact(const PGXPValue *pv, uint32_t value, int hi_half) {
++PGXP_HOT int half_exact(const PGXPValue *pv, uint32_t value, int hi_half) {
+     if (!comp_tracked(pv, value, hi_half)) return 0;
+     int32_t v16 = hi_half ? pv->y16 : pv->x16;
+     const int32_t half = (int32_t)(int16_t)(hi_half ? (value >> 16) : value);
+@@ -924,7 +936,7 @@ static inline int half_exact(const PGXPValue *pv, uint32_t value, int hi_half) {
+     return (v16 >> 16) == half;
+ }
+ 
+-static inline int carry_field(PGXPValue *dst, const PGXPValue *src,
++PGXP_HOT int carry_field(PGXPValue *dst, const PGXPValue *src,
+                               uint32_t sval, uint32_t result, int hi_half) {
+     if (!half_exact(src, sval, hi_half)) return 0;
+     uint32_t sh = hi_half ? 16u : 0u;
+@@ -941,14 +953,14 @@ static inline int carry_field(PGXPValue *dst, const PGXPValue *src,
+     return 1;
+ }
+ 
+-static inline int has_depth(const PGXPValue *pv) {
++PGXP_HOT int has_depth(const PGXPValue *pv) {
+     return pv && pv->gen == s_gen && (pv->flags & PGXP_F_VZ) && pv->z != 0;
+ }
+ 
+ /* Depth belongs to a whole vertex: it survives an op only when both halves of
+  * the result came from one operand that carried it, and the other operand is
+  * not itself a vertex (a constant, a mask, an offset). */
+-static inline void keep_depth(PGXPValue *dst, const PGXPValue *p,
++PGXP_HOT void keep_depth(PGXPValue *dst, const PGXPValue *p,
+                               const PGXPValue *other) {
+     if ((dst->flags & PGXP_F_VXY) == PGXP_F_VXY && has_depth(p) &&
+         !has_depth(other)) {
+@@ -982,11 +994,13 @@ static void alu_bitwise(PGXPValue *dst, const PGXPValue *a, uint32_t s1,
+ 
+ static const PGXPValue kNoShadow = { 0, 0, 0, 0, 0, 0 };
+ 
+-/* Snapshot a source GPR shadow: the destination may alias a source (in-place
+- * ops such as `or t2, t2, t9` or `addiu t0, t0, 4`), and it is reset before
+- * the sources are read. */
+-static inline const PGXPValue *gpr_shadow(uint32_t r, PGXPValue *copy) {
+-    *copy = (r != 0) ? s_gpr[r] : kNoShadow;
++/* A source GPR shadow, snapshotted when the destination aliases it (in-place
++ * ops such as `or t2, t2, t9` or `addiu t0, t0, 4`): the destination is reset
++ * before the sources are read. */
++PGXP_HOT const PGXPValue *gpr_shadow(uint32_t r, uint32_t dst_reg, PGXPValue *copy) {
++    if (r == 0) return &kNoShadow;
++    if (r != dst_reg) return &s_gpr[r];
++    *copy = s_gpr[r];
+     return copy;
+ }
+ 
+@@ -997,14 +1011,13 @@ static inline const PGXPValue *gpr_shadow(uint32_t r, PGXPValue *copy) {
+  * s1 = rt, s2 = shamt (or rs for the variable forms); MF/MT HI/LO s1 = the
+  * moved value. Computed before the half tier resets the destination, which
+  * may alias a source. */
+-static int alu_scalar(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2,
+-                      int *dst_reg, double *out) {
+-    const uint32_t op = f_op(instr);
++PGXP_HOT int alu_scalar(uint32_t op, uint32_t funct, uint32_t instr,
++                        uint32_t result, uint32_t s1, uint32_t s2,
++                        int *dst_reg, double *out) {
+     int pa = 0, pb = 0;
+     double a, b;
+     *dst_reg = -1;
+     if (op == 0) {
+-        const uint32_t funct = f_funct(instr);
+         const uint32_t rs = f_rs(instr), rt = f_rt(instr), rd = f_rd(instr);
+         switch (funct) {
+         case 0x10: case 0x12: {                /* MFHI / MFLO                 */
+@@ -1074,30 +1087,95 @@ static int alu_scalar(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2,
+     return 0;
+ }
+ 
+-static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2);
++/* A GPR operand that can contribute nothing to either tier: no flag on its
++ * half shadow (comp_tracked, half_exact, has_depth and half_scalar all need
++ * one) and no scalar of this generation. A live shadow with no flags and a
++ * dead one differ only in fields every reader guards with a flag. */
++PGXP_HOT int gpr_inert(uint32_t r) {
++    return r == 0 ||
++           ((s_gpr[r].gen != s_gen || s_gpr[r].flags == 0) &&
++            s_gpr_s[r].gen != s_gen);
++}
++
++/* Could alu_scalar find a precise operand? It needs a live scalar or a half
++ * shadow tracking both halves (half_scalar); without one it only names the
++ * destination and returns 0. */
++PGXP_HOT int gpr_may_be_precise(uint32_t r) {
++    return r != 0 && (s_gpr_s[r].gen == s_gen ||
++                      (s_gpr[r].gen == s_gen &&
++                       (s_gpr[r].flags & PGXP_F_VXY) == PGXP_F_VXY));
++}
++
++/* The ALU ops whose result, from inert operands (or from any operands, for
++ * the ops neither tier tracks), is just "known word, no precision": the
++ * destination shadow resets and its scalar dies. This is what alu_scalar +
++ * alu_halves produce for them, without the calls; it runs for every guest
++ * ALU instruction, so the common untracked case must stay cheap. Ops that
++ * can create exact halves from nothing (LUI, ANDI/ORI/XORI, the bitwise
++ * group, shifts by 16 in cpu-mode) and the HI/LO moves take the full path.
++ * Returns the destination register, or -1 for the full path. */
++PGXP_HOT int alu_untracked_dst(uint32_t op, uint32_t funct, uint32_t instr,
++                               uint32_t s2) {
++    if (op == 0) {
++        switch (funct) {
++        case 0x00: case 0x02: case 0x03:       /* SLL / SRL / SRA             */
++        case 0x04: case 0x06: case 0x07: {     /* SLLV / SRLV / SRAV          */
++            /* The half tier follows only a shift by 16, and only in cpu-mode;
++             * the scalar tier follows any shift of a precise value. */
++            const uint32_t sh = funct < 4 ? f_shamt(instr) : (s2 & 31u);
++            if (!s_cpu_mode) return (int)f_rd(instr);
++            if (sh == 16) return -1;
++            return gpr_may_be_precise(f_rt(instr)) ? -1 : (int)f_rd(instr);
++        }
++        case 0x20: case 0x21: case 0x22: case 0x23: {  /* ADD(U) / SUB(U)     */
++            /* Outside cpu-mode only the MOVE idioms carry a shadow. */
++            const uint32_t rs = f_rs(instr), rt = f_rt(instr);
++            const int move = rt == 0 || (funct < 0x22 && rs == 0);
++            if (!s_cpu_mode && !move) return (int)f_rd(instr);
++            return gpr_inert(rs) && gpr_inert(rt) ? (int)f_rd(instr) : -1;
++        }
++        case 0x10: case 0x11: case 0x12: case 0x13:    /* HI / LO moves       */
++        case 0x24: case 0x25: case 0x26: case 0x27:    /* AND/OR/XOR/NOR      */
++            return -1;
++        default:                               /* SLT/SLTU/...: never a vertex */
++            return (int)f_rd(instr);
++        }
++    }
++    if (op == 0x08 || op == 0x09) {            /* ADDI / ADDIU                */
++        if (!s_cpu_mode && (instr & 0xFFFFu) != 0) return (int)f_rt(instr);
++        return gpr_inert(f_rs(instr)) ? (int)f_rt(instr) : -1;
++    }
++    if (op >= 0x0C && op <= 0x0F)              /* ANDI/ORI/XORI/LUI           */
++        return -1;
++    return (int)f_rt(instr);                   /* SLTI/SLTIU, MFC0/CFC0       */
++}
+ 
+-extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
+-                             uint32_t result, uint32_t s1, uint32_t s2) {
+-    (void)cpu;
+-    if (!g_pgxp_active) return;
+-    int dst = -1;
+-    double v = 0.0;
+-    const int has = s_cpu_mode && alu_scalar(instr, result, s1, s2, &dst, &v);
+-    alu_halves(instr, result, s1, s2);
+-    if (dst > 0 && dst < 34) {
+-        if (has) sc_set(&s_gpr_s[dst], v, result);
+-        else     sc_kill(&s_gpr_s[dst]);
++PGXP_HOT int alu_scalar_possible(uint32_t op, uint32_t funct, uint32_t instr) {
++    if (op == 0) {
++        if (funct == 0x10 || funct == 0x12)    /* MFHI / MFLO                 */
++            return s_gpr_s[funct == 0x10 ? PGXP_REG_HI : PGXP_REG_LO].gen == s_gen;
++        return gpr_may_be_precise(f_rs(instr)) || gpr_may_be_precise(f_rt(instr));
+     }
++    if (op == 0x08 || op == 0x09) return gpr_may_be_precise(f_rs(instr));
++    return 0;
++}
++
++/* The register alu_scalar names as the destination (it does so even when it
++ * finds nothing precise). */
++PGXP_HOT int alu_scalar_dst(uint32_t op, uint32_t funct, uint32_t instr) {
++    if (op != 0) return (int)f_rt(instr);
++    if (funct == 0x11) return PGXP_REG_HI;
++    if (funct == 0x13) return PGXP_REG_LO;
++    return (int)f_rd(instr);
+ }
+ 
+-static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2) {
+-    uint32_t op = f_op(instr);
++PGXP_HOT void alu_halves(uint32_t op, uint32_t funct, uint32_t instr,
++                         uint32_t result, uint32_t s1, uint32_t s2) {
+     PGXPValue ca, cb;
+ 
+     if (op == 0) {                             /* SPECIAL                     */
+         uint32_t dst_reg = f_rd(instr);
+         uint32_t rs = f_rs(instr), rt = f_rt(instr);
+-        uint32_t funct = f_funct(instr);
+         if (funct == 0x11 || funct == 0x13) {  /* MTHI / MTLO                 */
+             PGXPValue *hl = &s_gpr[funct == 0x11 ? PGXP_REG_HI : PGXP_REG_LO];
+             if (s_cpu_mode && rs != 0 && s_gpr[rs].gen == s_gen) {
+@@ -1122,7 +1200,7 @@ static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2
+         case 0x00: case 0x02: case 0x03:       /* SLL / SRL / SRA             */
+         case 0x04: case 0x06: case 0x07: {     /* SLLV / SRLV / SRAV          */
+             uint32_t sh = (funct < 4) ? f_shamt(instr) : (s2 & 31u);
+-            const PGXPValue *src = gpr_shadow(rt, &ca);
++            const PGXPValue *src = gpr_shadow(rt, dst_reg, &ca);
+             int right = (funct & 3u) != 0;
+             pv_reset(dst, result);
+             if (!s_cpu_mode || sh != 16 || src->gen != s_gen)
+@@ -1147,8 +1225,8 @@ static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2
+             return;
+         }
+         case 0x24: case 0x25: case 0x26: case 0x27: {  /* AND/OR/XOR/NOR     */
+-            const PGXPValue *a = gpr_shadow(rs, &ca);
+-            const PGXPValue *b = gpr_shadow(rt, &cb);
++            const PGXPValue *a = gpr_shadow(rs, dst_reg, &ca);
++            const PGXPValue *b = gpr_shadow(rt, dst_reg, &cb);
+             /* OR with $zero is the MOVE idiom: the whole shadow, depth too. */
+             if (funct == 0x25 && (rs == 0 || rt == 0)) {
+                 const PGXPValue *m = (rt == 0) ? a : b;
+@@ -1163,8 +1241,8 @@ static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2
+         }
+         case 0x20: case 0x21:                  /* ADD / ADDU                  */
+         case 0x22: case 0x23: {                /* SUB / SUBU                  */
+-            const PGXPValue *a = gpr_shadow(rs, &ca);
+-            const PGXPValue *b = gpr_shadow(rt, &cb);
++            const PGXPValue *a = gpr_shadow(rs, dst_reg, &ca);
++            const PGXPValue *b = gpr_shadow(rt, dst_reg, &cb);
+             int is_sub = (funct == 0x22 || funct == 0x23);
+             /* MOVE idioms first - exact, so they run in both tiers. */
+             if (rt == 0 || (!is_sub && rs == 0)) {
+@@ -1207,7 +1285,7 @@ static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2
+     uint32_t dst_reg = f_rt(instr);
+     if (dst_reg == 0) return;
+     PGXPValue *dst = &s_gpr[dst_reg];
+-    const PGXPValue *a = gpr_shadow(f_rs(instr), &ca);
++    const PGXPValue *a = gpr_shadow(f_rs(instr), dst_reg, &ca);
+ 
+     switch (op) {
+     case 0x0F: {                               /* LUI: both halves exact      */
+@@ -1262,6 +1340,40 @@ static void alu_halves(uint32_t instr, uint32_t result, uint32_t s1, uint32_t s2
+     }
+ }
+ 
++/* One ALU hook, its opcode (and SPECIAL function) decoded once. */
++PGXP_HOT void alu_body(uint32_t op, uint32_t funct, uint32_t instr,
++                       uint32_t result, uint32_t s1, uint32_t s2) {
++    const int quick = alu_untracked_dst(op, funct, instr, s2);
++    if (quick >= 0) {
++        if (quick != 0) {
++            pv_reset(&s_gpr[quick], result);
++            if (s_cpu_mode) sc_kill(&s_gpr_s[quick]);
++        }
++        return;
++    }
++    int dst = -1;
++    double v = 0.0;
++    int has = 0;
++    if (s_cpu_mode) {
++        if (alu_scalar_possible(op, funct, instr))
++            has = alu_scalar(op, funct, instr, result, s1, s2, &dst, &v);
++        else
++            dst = alu_scalar_dst(op, funct, instr);
++    }
++    alu_halves(op, funct, instr, result, s1, s2);
++    if (dst > 0 && dst < 34) {
++        if (has) sc_set(&s_gpr_s[dst], v, result);
++        else     sc_kill(&s_gpr_s[dst]);
++    }
++}
++
++extern "C" void psx_pgxp_alu(struct CPUState *cpu, uint32_t instr,
++                             uint32_t result, uint32_t s1, uint32_t s2) {
++    (void)cpu;
++    if (!g_pgxp_active) return;
++    alu_body(f_op(instr), f_funct(instr), instr, result, s1, s2);
++}
++
+ extern "C" void psx_pgxp_muldiv(struct CPUState *cpu, uint32_t instr,
+                                 uint32_t hi, uint32_t lo,
+                                 uint32_t s1, uint32_t s2) {
+-- 
+2.54.0.windows.1
+

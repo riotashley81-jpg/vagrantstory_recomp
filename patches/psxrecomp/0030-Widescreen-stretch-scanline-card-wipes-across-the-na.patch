@@ -1,0 +1,158 @@
+From 00cd9030a777013eae2d12c03bce00999f2765e0 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 18 Oct 2026 00:57:42 +0200
+Subject: [PATCH 30/33] Widescreen: stretch scanline card wipes across the
+ native-wide frame
+
+Opt-in gpu_ws_set_row_wipe(): a card revealed row by row as opaque black
+1-pixel lines and 1-pixel-high lettering sprites in 64-pixel segments is
+mapped linearly from the 4:3 display to the wide one. Lettering stays in
+place; its sprite paints the black its stretched span needs and is clipped
+at a wipe edge.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h |  4 ++
+ runtime/src/gpu.c     | 97 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 101 insertions(+)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index d3a9fcb5..235eeede 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -287,6 +287,10 @@ void gpu_ws_tag_tiled_strip(uint32_t prim, int32_t anchor,
+  * right edge of the display grows across that side's margin, so a black screen
+  * built from a grid of tiles covers the wide frame. Default off. */
+ void gpu_ws_set_black_edge_rects(int on);
++/* Native-wide opt-in: stretch a scanline wipe (a 4:3 card revealed row by row
++ * as opaque black 1-pixel lines and 1-pixel-high lettering sprites in
++ * 64-pixel segments) across the wide frame. Default off. */
++void gpu_ws_set_row_wipe(int on);
+ 
+ /* Native-wide (mode 2) on a game frame. ws_nw_extra() is the total width the
+  * frame grows by, in display pixels (the present path widens the display read
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 0e836d1e..15cda31b 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -5529,6 +5529,101 @@ static void gp0_exec_shaded_textured_quad(void) {
+     }
+ }
+ 
++/* Title opt-in (gpu_ws_set_row_wipe): a full-screen card wiped in or out one
++ * scanline at a time. Vagrant Story's credit cards do this: each row of the
++ * 4:3 screen is cut into 64-pixel segments, plain segments drawn as opaque
++ * black 1-pixel lines and the card's lettering as 1-pixel-high sprites, and
++ * the covered span of each row grows from (or shrinks toward) the right edge.
++ * Segments of a row arrive right to left. In native-wide mode the wipe is
++ * stretched across the wide frame: each segment's span is mapped linearly
++ * from the 4:3 display to the wide one. The lettering itself stays at its
++ * original position (it is the finished card's text); a lettering sprite
++ * only paints black over the part of its stretched span its own pixels do
++ * not cover, and loses the part of its lettering that a wipe edge inside it
++ * has not yet reached once stretched. */
++static int ws_row_wipe = 0;
++static int32_t ws_row_wipe_y = INT32_MIN;
++static int32_t ws_row_wipe_prev_sprite_x = INT32_MIN;
++static uint32_t ws_row_wipe_frame = UINT32_MAX;
++void gpu_ws_set_row_wipe(int on) { ws_row_wipe = on ? 1 : 0; }
++
++static int ws_row_wipe_active(void) {
++    return ws_row_wipe && ws_native_wide_active() &&
++           draw_area_wide_x_margin() > 0;
++}
++
++/* Display-space X (4:3 span [X, X+W]) to the wide span [X-off, X+W+off]. */
++static int32_t ws_row_wipe_scale(int32_t x) {
++    int32_t X = ws_disp_x(), W = ws_disp_w(), off = ws_nw_offset();
++    return X - off + (int32_t)((int64_t)(x - X) * (W + 2 * off) / W);
++}
++
++/* [a, b) lies inside one 64-pixel segment of the 4:3 display. */
++static int ws_row_wipe_segment(int32_t a, int32_t b) {
++    int32_t X = ws_disp_x(), W = ws_disp_w();
++    if (a < X || b > X + W || b <= a) return 0;
++    return (a - X) / 64 == (b - 1 - X) / 64;
++}
++
++static void ws_row_wipe_enter_row(int32_t y) {
++    uint32_t frame = (uint32_t)s_frame_count;
++    if (y != ws_row_wipe_y || frame != ws_row_wipe_frame)
++        ws_row_wipe_prev_sprite_x = INT32_MIN;
++    ws_row_wipe_y = y;
++    ws_row_wipe_frame = frame;
++}
++
++static void ws_row_wipe_black(int32_t a, int32_t b, int32_t y) {
++    if (b <= a) return;
++    int32_t px = a + draw_offset_x, py = y + draw_offset_y;
++    if (draw_area_out_rect(px, py, (int)(b - a), 1)) return;
++    gr_set_semi_transparency(0, (int)semi_transparency);
++    gr_draw_flat_rect(px, py, (int)(b - a), 1, 0);
++}
++
++/* A wipe line: opaque black, horizontal, inside one segment, touching the
++ * segment's start or end. Draws its stretched span; returns 1 if handled. */
++static int ws_row_wipe_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1,
++                            uint32_t cmd, int semi_trans) {
++    if (!ws_row_wipe || semi_trans || (cmd & 0xFFFFFFu) || y0 != y1) return 0;
++    if (!ws_row_wipe_active()) return 0;
++    int32_t a = x0 < x1 ? x0 : x1, b = (x0 < x1 ? x1 : x0) + 1;
++    if (!ws_row_wipe_segment(a, b)) return 0;
++    int32_t X = ws_disp_x();
++    if ((a - X) % 64 && (b - X) % 64) return 0;
++    ws_row_wipe_enter_row(y0);
++    ws_row_wipe_prev_sprite_x = INT32_MIN;
++    ws_row_wipe_black(ws_row_wipe_scale(a), ws_row_wipe_scale(b), y0);
++    return 1;
++}
++
++/* A lettering sprite of the wipe: neutral 1-pixel-high sprite inside one
++ * segment. Paints the black its stretched span needs and clips its lettering
++ * at a wipe edge; returns 1 when nothing of the lettering is left to draw. */
++static int ws_row_wipe_sprite(int32_t *x, int *u, int *w, int32_t y,
++                              int h, uint32_t cmd) {
++    if (!ws_row_wipe || h != 1 || (cmd & 0xFFFFFFu) != 0x808080u) return 0;
++    if (!ws_row_wipe_active()) return 0;
++    int32_t a = *x, b = *x + *w;
++    if (!ws_row_wipe_segment(a, b)) return 0;
++    int32_t X = ws_disp_x();
++    int32_t sa = ws_row_wipe_scale(a), sb = ws_row_wipe_scale(b);
++    ws_row_wipe_enter_row(y);
++    /* Left of the lettering: the next segment (drawn after) covers its own
++     * part again. Right of it: only when no lettering was drawn there. */
++    if (sa < a) ws_row_wipe_black(sa, a, y);
++    if (sb > b && ws_row_wipe_prev_sprite_x != b) ws_row_wipe_black(b, sb, y);
++    ws_row_wipe_prev_sprite_x = a;
++    int32_t lo = a, hi = b;
++    if ((a - X) % 64 && sa > lo) lo = sa;
++    if ((b - X) % 64 && sb < hi) hi = sb;
++    if (hi <= lo) return 1;
++    *u += (int)(lo - a);
++    *x = lo;
++    *w = (int)(hi - lo);
++    return 0;
++}
++
+ /* Execute mono line (GP0 0x40-0x47) — Bresenham */
+ static void gp0_exec_mono_line(void) {
+     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+@@ -5537,6 +5632,7 @@ static void gp0_exec_mono_line(void) {
+     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
+     if (psx_gpu_line_oversize(x0, y0, x1, y1)) return;
++    if (ws_row_wipe_line(x0, y0, x1, y1, gp0_cmd_buf[0], semi_trans)) return;
+     if (x0 == x1 && ws_local_viewport_divider(x0, y0 < y1 ? y0 : y1,
+             x0 + 1, (y0 > y1 ? y0 : y1) + 1, color, semi_trans)) {
+         gr_wide_disable_target();
+@@ -5688,6 +5784,7 @@ static void gp0_exec_textured_rect(void) {
+     int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
+     if (w > 1023) w = 1023;
+     if (h > 511)  h = 511;
++    if (ws_row_wipe_sprite(&x0, &u0, &w, y0, h, color24)) return;
+     ws_clear_tagged_rect_reveal(y0 + draw_offset_y, h);
+ 
+     const WsTag *tile_tag = ws_screen_tag();
+-- 
+2.54.0.windows.1
+

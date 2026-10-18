@@ -1,0 +1,78 @@
+From be7caadad7a6a16cfe2ea3050c083f1a05b4437e Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 17 Oct 2026 19:39:54 +0200
+Subject: [PATCH 29/33] Smooth motion: place near-camera vertices with the
+ GTE's clamped projection
+
+fg_cam_place moved each camera-placed vertex by the change of the exact
+h*x/z projection. The GTE saturates h/SZ3 at 0x1FFFF (divide overflow when
+2*SZ3 <= H), so a vertex that close to the camera is drawn at IR*2 in the
+real frames while the exact projection swings without bound. Both ends of the
+in-between motion now use the GTE's projection (IR and SZ saturation, the
+17-bit divide), so such vertices follow the curve the real frames draw.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/frame_gen.c | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/runtime/src/frame_gen.c b/runtime/src/frame_gen.c
+index 1b16bb24..284c48f0 100644
+--- a/runtime/src/frame_gen.c
++++ b/runtime/src/frame_gen.c
+@@ -486,12 +486,24 @@ int fg_cam_fit(const FgPrimList *older, const FgPrimList *newer, const FgCamPara
+     return 1;
+ }
+ 
+-/* Projection of a camera-space point (0 when behind the near plane). */
+-static int proj(const double v[3], double h, double *sx, double *sy) {
+-    if (v[2] < 1.0) return 0;
+-    *sx = h * v[0] / v[2];
+-    *sy = h * v[1] / v[2];
+-    return 1;
++/* The GTE's projection of a camera-space point, without the screen offset
++ * (RTPS/RTPT, psx-spx "GTE Division"): IR1/IR2 saturate to 16 bits, SZ3 to
++ * 0..0xFFFF, and h/SZ3 is a 17-bit fraction that saturates at 0x1FFFF (just
++ * under 2.0) -- with a divide overflow whenever 2*SZ3 <= h. A point that
++ * close to the camera is drawn at IR * 2 whatever its depth, so it is not
++ * the exact h*x/z: that grows without bound as z falls, so moving a packet
++ * vertex by its change could throw a close-up mesh hundreds of pixels in an
++ * in-between frame (Vagrant Story cutscene meshes reach SZ 5..30 with H 224).
++ * Moved along this curve instead, the vertex follows what the real frames
++ * draw. */
++static void proj_gte(const double v[3], double h, double *sx, double *sy) {
++    const double ir1 = fmin(fmax(v[0], -32768.0), 32767.0);
++    const double ir2 = fmin(fmax(v[1], -32768.0), 32767.0);
++    const double sz = fmin(fmax(v[2], 0.0), 65535.0);
++    const double qmax = 131071.0 / 65536.0;
++    const double q = 2.0 * sz <= h ? qmax : fmin(h / sz, qmax);
++    *sx = ir1 * q;
++    *sy = ir2 * q;
+ }
+ 
+ typedef struct { int32_t qx, qy; float dx, dy; uint32_t n; } NAcc;
+@@ -550,13 +562,14 @@ void fg_cam_place(const FgPrimList *newer, FgCamFit *fit, const FgVert *verts,
+                 for (int c = 0; c < 3; c++) pt[c] += Tt[vi][c];
+             }
+             double ax, ay, bx, by;
+-            if (!proj(pn, pr->h[k], &bx, &by)) continue;
+-            /* Near geometry the in-between camera is passing: projected at a
+-             * clamped depth. A function of the vertex alone, so triangles
+-             * sharing it stay closed (no cracks onto what is behind). */
+-            const double zmin = fmax(16.0, 0.25 * pn[2]);
+-            if (pt[2] < zmin) { pt[2] = zmin; clamped++; }
+-            if (!proj(pt, pr->h[k], &ax, &ay)) continue;
++            /* Near geometry the in-between camera is passing (the frame is
++             * not generated, fg_on_present). Both positions come from the
++             * GTE's own projection, a function of the vertex alone, so
++             * triangles sharing it stay closed (no cracks onto what is
++             * behind) and none is thrown across the screen. */
++            if (pn[2] >= 1.0 && pt[2] < fmax(16.0, 0.25 * pn[2])) clamped++;
++            proj_gte(pn, pr->h[k], &bx, &by);
++            proj_gte(pt, pr->h[k], &ax, &ay);
+             dxs[i] = (float)(ax - bx); dys[i] = (float)(ay - by);
+         }
+     }
+-- 
+2.54.0.windows.1
+

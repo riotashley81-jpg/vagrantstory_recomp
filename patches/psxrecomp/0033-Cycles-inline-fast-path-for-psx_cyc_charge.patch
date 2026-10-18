@@ -1,0 +1,290 @@
+From c847d8eebbf1dbf93b30cb98c537abe9aa5ad308 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 18 Oct 2026 15:51:37 +0200
+Subject: [PATCH 33/33] Cycles: inline fast path for psx_cyc_charge
+
+MSVC never inlines psx_cyc_charge into the out-of-line psx_cyc_step and load
+helpers, so every guest instruction paid a call into the full charge path.
+psx_cyc_charge is now a forced-inline front for the one case the full path
+settles with an add: a batch is already open and the charge keeps it under
+the limit recorded when it opened (g_psx_cyc_fast_limit). Everything else -
+opening a batch, guest_cycle_scale, lockstep replay, conservative stepping,
+device service, local accumulators, publishing - goes through the unchanged
+full path (psx_cyc_charge_full). The fast limit is 0 or a copy of the open
+batch's limit; every writer of the batch, its limit or a special mode clears
+it, and 0 only routes charges to the full path.
+
+Only the front is forced. Forcing psx_cyc_step / load helpers into every
+instruction too quadrupled the executable and gained ~1%.
+
+Changes the codegen hash (psx_cyc.h / psx_cycles.h): existing savestates and
+overlay-DLL caches are keyed on it. The emitted C and the DLL path are
+unchanged, so states and caches re-tagged to the new hash are valid.
+
+Behaviour-identical: [BENCH_STATE] guest cycles, RAM and GP0/GP1 hashes match
+the previous build over 1200 frames from savestates 9 and 1 (3 runs each).
+Opening cutscene (MSVC Release): host cycles -4.5%, busy 60.8% -> 58.2%;
+slot 1 cutscene -4.7%, 59.3% -> 56.5%.
+
+Also: [BENCH_STATE_CHUNKS] per-64 KiB RAM hashes (PSX_BENCH_STATE_CHUNKS=1).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/psx_cyc.h      | 23 ++++++++++++++++++++++-
+ runtime/include/psx_cycles.h   | 22 ++++++++++++++++++++++
+ runtime/src/debug_server.c     |  1 +
+ runtime/src/dirty_ram_interp.c |  3 +++
+ runtime/src/main.cpp           | 10 ++++++++++
+ runtime/src/psx_cycles.c       | 10 +++++++++-
+ 6 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/include/psx_cyc.h b/runtime/include/psx_cyc.h
+index 0a95f0ff..6022535d 100644
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -67,6 +67,7 @@ static inline void psx_cyc_local_begin(uint32_t *acc) {
+ #if !defined(PSX_COSIM)
+     if (acc) *acc = 0;
+     g_psx_cyc_local_acc = acc;
++    g_psx_cyc_fast_limit = 0;
+ #else
+     (void)acc;
+ #endif
+@@ -90,7 +91,9 @@ static inline void psx_cyc_local_cleanup(uint32_t **guard) {
+ }
+ #endif
+ 
+-static inline void psx_cyc_charge(uint32_t cycles) {
++/* The full charge path. psx_cyc_charge below is its inline front: it takes
++ * only the case this function would settle by adding to an open batch. */
++static inline void psx_cyc_charge_full(uint32_t cycles) {
+     if (cycles == 0u) return;
+ #if defined(PSX_OVERLAY_DLL_BUILD)
+     psx_cpu_charge(cycles);
+@@ -147,6 +150,8 @@ static inline void psx_cyc_charge(uint32_t cycles) {
+                 g_psx_cyc_batch_limit = room == 0u ? 1u :
+                     (room < (uint64_t)PSX_CYC_BATCH_SOFT
+                         ? (uint32_t)room : (uint32_t)PSX_CYC_BATCH_SOFT);
++                /* Every special mode was ruled out above. */
++                g_psx_cyc_fast_limit = g_psx_cyc_batch_limit;
+             }
+             if (sum < g_psx_cyc_batch_limit) {
+                 g_psx_cyc_batch = sum;
+@@ -159,6 +164,22 @@ static inline void psx_cyc_charge(uint32_t cycles) {
+ #endif
+ }
+ 
++/* One guest charge. Fast path: a batch is already open and the charge keeps
++ * it under the limit recorded when it opened (g_psx_cyc_fast_limit, psx_
++ * cycles.h) -- exactly the case the full path settles with the same add.
++ * cycles == 0 leaves the batch unchanged, as the full path's early return. */
++PSX_CYC_FORCEINLINE void psx_cyc_charge(uint32_t cycles) {
++#if !defined(PSX_OVERLAY_DLL_BUILD) && !defined(PSX_COSIM)
++    const uint32_t prior = g_psx_cyc_batch;
++    const uint32_t sum = prior + cycles;
++    if (prior != 0u && sum < g_psx_cyc_fast_limit) {
++        g_psx_cyc_batch = sum;
++        return;
++    }
++#endif
++    psx_cyc_charge_full(cycles);
++}
++
+ /* §1 base (Beetle cpu.cpp:795-798). */
+ static inline void psx_cyc_base(CPUState* cpu) {
+     uint8_t w = cpu->read_absorb_which;
+diff --git a/runtime/include/psx_cycles.h b/runtime/include/psx_cycles.h
+index dd72f819..6981984a 100644
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -57,6 +57,25 @@ extern int g_ls_replay_active;
+ extern uint32_t g_psx_cyc_batch;
+ extern uint32_t g_psx_cyc_batch_limit;
+ 
++/* Inline charge fast path (psx_cyc.h psx_cyc_charge): 0, or a copy of
++ * g_psx_cyc_batch_limit taken when the full path opened the current batch
++ * with every special mode off (no guest_cycle_scale, lockstep replay,
++ * conservative stepping, device service or local accumulator). While a batch
++ * is open and a charge stays under it, the fast path adds exactly as the full
++ * path would. Zero is always safe -- it only sends charges down the full path
++ * -- so every writer of the batch, its limit or a special mode clears it. */
++extern uint32_t g_psx_cyc_fast_limit;
++
++/* MSVC stops inlining inside the huge recompiled functions. Only the tiny
++ * charge front (psx_cyc.h) is forced: it lands in the out-of-line
++ * psx_cyc_step / load helper bodies, not at every instruction. Forcing those
++ * helpers into every site too quadrupled the executable and ran ~15% slower. */
++#if defined(_MSC_VER) && !defined(__clang__)
++#define PSX_CYC_FORCEINLINE static __forceinline
++#else
++#define PSX_CYC_FORCEINLINE static inline
++#endif
++
+ /* GCC/Clang-generated functions can defer deadline probes within a basic
+  * block. Interrupt/MMIO edges still publish the accumulated guest cycles. */
+ extern int g_psx_cyc_bb_defer;
+@@ -158,6 +177,7 @@ static inline void psx_advance_cycles(uint32_t cycles) {
+         uint32_t b = g_psx_cyc_batch;
+         g_psx_cyc_batch = 0;
+         g_psx_cyc_batch_limit = 0;
++        g_psx_cyc_fast_limit = 0;
+         if (cycles <= UINT32_MAX - b) cycles += b;
+         else {
+             /* Extreme: publish b first, then continue with cycles. */
+@@ -232,6 +252,7 @@ static inline void psx_cyc_local_publish(void) {
+     g_psx_cyc_local_acc = NULL;
+     psx_advance_cycles(v);
+     g_psx_cyc_local_acc = acc;
++    g_psx_cyc_fast_limit = 0;
+ #endif
+ }
+ 
+@@ -242,6 +263,7 @@ static inline void psx_cyc_batch_flush(void) {
+     if (!b) return;
+     g_psx_cyc_batch = 0;
+     g_psx_cyc_batch_limit = 0;
++    g_psx_cyc_fast_limit = 0;
+     psx_advance_cycles(b);
+ #endif
+ }
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 7d6d6b16..2bd63b05 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -14399,6 +14399,7 @@ static void handle_overlay_native_event_granularity(int id, const char *json)
+     }
+     int conservative = (strcmp(mode, "conservative") == 0);
+     g_event_step_conservative = conservative;
++    { extern uint32_t g_psx_cyc_fast_limit; g_psx_cyc_fast_limit = 0; }  /* psx_cycles.h */
+     send_fmt("{\"id\":%d,\"ok\":true,\"event_granularity\":\"%s\"}\n",
+              id, conservative ? "conservative" : "normal");
+ }
+diff --git a/runtime/src/dirty_ram_interp.c b/runtime/src/dirty_ram_interp.c
+index 434f22a5..16ef2ae1 100644
+--- a/runtime/src/dirty_ram_interp.c
++++ b/runtime/src/dirty_ram_interp.c
+@@ -3802,6 +3802,7 @@ int ls_shadow_replay_begin(void) {
+     s_ls_replay_done = 0;
+     s_ls_shadow_owner = 2;
+     g_ls_replay_active = 1;
++    { extern uint32_t g_psx_cyc_fast_limit; g_psx_cyc_fast_limit = 0; }  /* replay charges: full path */
+     g_ls_mode = 2;
+     return 1;
+ }
+@@ -3906,6 +3907,7 @@ static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target
+     uint32_t    sav_unsup_insn   = g_unsupported_insn;
+     const char *sav_unsup_reason = g_unsupported_reason;
+     g_ls_replay_active = 1;
++    { extern uint32_t g_psx_cyc_fast_limit; g_psx_cyc_fast_limit = 0; }  /* replay charges: full path */
+     g_ls_mode = 2;
+     uint32_t pc = rep.pc;
+     int cap = 512, steps = 0;
+@@ -4024,6 +4026,7 @@ static void lsf_replay_and_compare(CPUState *native_post, uint32_t frame,
+     uint32_t    sav_func_addr    = g_debug_current_func_addr;
+ 
+     g_ls_replay_active = 1;
++    { extern uint32_t g_psx_cyc_fast_limit; g_psx_cyc_fast_limit = 0; }  /* replay charges: full path */
+     g_ls_mode = 2;
+ 
+     uint32_t pc = entry_pc;
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 6e04c295..09669bbc 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -4354,6 +4354,16 @@ static void runtime_perf_bench_state(const char *edge) {
+                  (unsigned long long)bench_fnv1a(g_psx_ram, g_psx_ram_size),
+                  (unsigned long long)bench_fnv1a(gpu_get_vram_ptr(), gpu_get_vram_bytes()),
+                  (unsigned long long)g_gpu_cmd_hash);
++    /* PSX_BENCH_STATE_CHUNKS=1: one hash per 64 KiB of RAM, to locate which
++     * region two runs disagree on. */
++    static int chunks = -1;
++    if (chunks < 0) { const char *e = std::getenv("PSX_BENCH_STATE_CHUNKS"); chunks = e && e[0] == '1'; }
++    if (chunks) {
++        std::fprintf(stdout, "[BENCH_STATE_CHUNKS] %s", edge);
++        for (uint32_t off = 0; off < g_psx_ram_size; off += 0x10000u)
++            std::fprintf(stdout, " %08x", (unsigned)bench_fnv1a(g_psx_ram + off, 0x10000u));
++        std::fprintf(stdout, "\n");
++    }
+ }
+ 
+ static void runtime_perf_bench_tick(uint64_t now) {
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 0e5e91a2..789e3516 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -22,6 +22,7 @@
+ #endif
+ 
+ uint64_t psx_cycle_count = 0;
++extern uint32_t g_psx_cyc_fast_limit;   /* defined with the batch below */
+ uint32_t g_psx_gcs_recip_q16 = 65536u;
+ uint32_t g_psx_gcs_frac = 0u;
+ static uint32_t s_psx_gcs_cfg = 1u;     /* [timing] guest_cycle_scale */
+@@ -41,6 +42,7 @@ static void psx_guest_cycle_scale_apply(void) {
+     uint32_t n = open ? s_psx_gcs_cfg : 1u;
+     if (n == s_psx_gcs_live) return;
+     s_psx_gcs_live = n;
++    g_psx_cyc_fast_limit = 0;   /* charges may now be scaled: full path */
+     g_psx_gcs_recip_q16 = psx_gcs_recip_for(n);
+     g_psx_gcs_frac = 0u;
+ }
+@@ -124,6 +126,7 @@ uint32_t psx_guest_cycle_scale(void) { return s_psx_gcs_live; }
+ uint32_t psx_guest_cycle_scale_config(void) { return s_psx_gcs_cfg; }
+ uint32_t g_psx_cyc_batch = 0;
+ uint32_t g_psx_cyc_batch_limit = 0;
++uint32_t g_psx_cyc_fast_limit = 0;   /* psx_cycles.h: 0 or the open batch's limit */
+ int      g_psx_cyc_bb_defer = 0;
+ uint32_t *g_psx_cyc_local_acc = NULL;
+ static int      s_cycle_replay_active = 0;
+@@ -205,7 +208,7 @@ int g_event_step_conservative = 0;
+  * timeline?") needs the production binary to run BOTH ways. */
+ void psx_event_step_conservative_env_init(void) {
+     const char *e = getenv("PSX_EVENT_STEP_CONSERVATIVE");
+-    if (e && e[0] == '1') g_event_step_conservative = 1;
++    if (e && e[0] == '1') { g_event_step_conservative = 1; g_psx_cyc_fast_limit = 0; }
+ }
+ 
+ static void advance_devices(uint32_t c) {
+@@ -352,6 +355,7 @@ void psx_devices_service_to_now(void) {
+     if (g_plp_cycle_diag) g_plp_svc_calls++;
+     g_psx_cycle_fast_limit = 0;
+     s_in_device_service = 1;
++    g_psx_cyc_fast_limit = 0;   /* device code charges go straight to the clock */
+     uint64_t target = psx_cycle_count;
+     if (s_devices_synced_cycle < target) {
+         /* Rewind and re-play the gap in event-bounded chunks so device
+@@ -760,6 +764,7 @@ void psx_cycles_resync_after_restore(CPUState *cpu) {
+     g_psx_cyc_local_acc    = NULL;
+     g_psx_cyc_batch        = 0;
+     g_psx_cyc_batch_limit  = 0;
++    g_psx_cyc_fast_limit   = 0;
+     g_psx_cyc_bb_defer     = 0;
+     s_devices_synced_cycle = psx_cycle_count;
+     psx_next_service_cycle = 0;   /* recompute on next charge */
+@@ -807,6 +812,7 @@ void psx_cycles_reset_for_boot(void) {
+     g_psx_cyc_local_acc    = NULL;
+     g_psx_cyc_batch        = 0;
+     g_psx_cyc_batch_limit  = 0;
++    g_psx_cyc_fast_limit   = 0;
+     g_psx_cyc_bb_defer     = 0;
+     psx_cycle_count        = 0;
+     s_devices_synced_cycle = 0;
+@@ -996,6 +1002,7 @@ static void freeze_save(PsxCycleFreeze *save) {
+      * guest code and are republished, unchanged, after the freeze. */
+     g_psx_cyc_batch = 0;
+     g_psx_cyc_batch_limit = 0;
++    g_psx_cyc_fast_limit = 0;
+     g_psx_cyc_local_acc = NULL;
+     psx_in_device_service = 0;
+     s_freeze_start = psx_cycle_count;
+@@ -1006,6 +1013,7 @@ static void freeze_save(PsxCycleFreeze *save) {
+ static void freeze_restore_deferred(const PsxCycleFreeze *save) {
+     g_psx_cyc_batch = save->batch;
+     g_psx_cyc_batch_limit = save->batch_limit;
++    g_psx_cyc_fast_limit = 0;   /* the full path re-derives it at the next batch */
+     g_psx_cyc_local_acc = save->local_acc;
+     if (save->local_acc) *save->local_acc = save->local_acc_value;
+     psx_in_device_service = save->in_device_service;
+-- 
+2.54.0.windows.1
+

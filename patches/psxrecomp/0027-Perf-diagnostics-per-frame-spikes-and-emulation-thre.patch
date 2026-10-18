@@ -1,0 +1,160 @@
+From c2e0eabb8e0d8515937d7ee449e62efffc0724a4 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 17 Oct 2026 18:42:05 +0200
+Subject: [PATCH 27/33] Perf diagnostics: per-frame spikes and emulation-thread
+ cycles
+
+PSX_RUNTIME_PERF_DIAG's cadence line now reports, per interval, the
+longest frame, the longest guest-work span and how many frames took over
+20 / 33 ms: an interval that still averages 60 fps can hide the single
+long frames heard as stutter. The PSX_BENCH_WINDOW line adds the
+emulation thread's own cycles over the window (QueryThreadCycleTime on
+Windows), which stop while the thread is descheduled, so two builds can
+be compared on a busy machine.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/main.cpp | 61 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 55 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 9f053c5f..82468417 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -4172,6 +4172,7 @@ struct RuntimePerfSnapshot {
+     uint64_t counter = 0;
+     uint64_t frame = 0;
+     uint64_t guest_work_ticks = 0;
++    uint64_t guest_work_cycles = 0;
+     uint64_t pacer_ticks = 0;
+     uint64_t autocapture_ticks = 0;
+     uint64_t provider_poll_ticks = 0;
+@@ -4201,9 +4202,21 @@ struct RuntimePerfState {
+     uint64_t frequency = 0;
+     uint64_t last_frame_exit_counter = 0;
+     uint64_t guest_work_ticks = 0;
++    /* The emulation thread's own CPU cycles over the same spans: unlike the
++     * wall-clock ticks they stop while the thread is descheduled, so a
++     * benchmark window compares builds even on a busy machine. */
++    uint64_t last_frame_exit_cycles = 0;
++    uint64_t guest_work_cycles = 0;
+     uint64_t pacer_ticks = 0;
+     uint64_t autocapture_ticks = 0;
+     uint64_t provider_poll_ticks = 0;
++    /* Per-frame spikes within the current report interval: an average that
++     * still reads 60 fps can hide the single long frames heard as stutter. */
++    uint64_t last_frame_begin_counter = 0;
++    uint64_t max_frame_ticks = 0;
++    uint64_t max_work_ticks = 0;
++    uint32_t frames_over_20ms = 0;
++    uint32_t frames_over_33ms = 0;
+     bool bench_configured = false;
+     bool bench_started = false;
+     bool bench_reported = false;
+@@ -4229,6 +4242,16 @@ static bool runtime_perf_parse_window(const char *text, uint64_t *start,
+     return true;
+ }
+ 
++static uint64_t runtime_perf_thread_cycles() {
++#ifdef _WIN32
++    ULONG64 cycles = 0;
++    QueryThreadCycleTime(GetCurrentThread(), &cycles);
++    return (uint64_t)cycles;
++#else
++    return 0;
++#endif
++}
++
+ static void runtime_perf_init() {
+     if (g_runtime_perf.initialized) return;
+     g_runtime_perf.initialized = true;
+@@ -4277,6 +4300,7 @@ static RuntimePerfSnapshot runtime_perf_snapshot(uint64_t now) {
+     s.counter = now;
+     s.frame = s_frame_count;
+     s.guest_work_ticks = g_runtime_perf.guest_work_ticks;
++    s.guest_work_cycles = g_runtime_perf.guest_work_cycles;
+     s.pacer_ticks = g_runtime_perf.pacer_ticks;
+     s.autocapture_ticks = g_runtime_perf.autocapture_ticks;
+     s.provider_poll_ticks = g_runtime_perf.provider_poll_ticks;
+@@ -4318,7 +4342,7 @@ static void runtime_perf_bench_tick(uint64_t now) {
+     const RuntimePerfSnapshot &start = g_runtime_perf.bench_start;
+     std::fprintf(stdout,
+         "[BENCH] window=%llu:%llu frames=%llu wall_ms=%.3f "
+-        "guest_work_ms=%.3f pacer_ms=%.3f autocapture_main_ms=%.3f "
++        "guest_work_ms=%.3f guest_work_mcycles=%.1f pacer_ms=%.3f autocapture_main_ms=%.3f "
+         "provider_poll_ms=%.3f "
+         "dirty_insns=+%llu dirty_dispatches=+%llu "
+         "overlay_native=+%llu overlay_interp=+%llu overlay_loads=+%u "
+@@ -4330,6 +4354,7 @@ static void runtime_perf_bench_tick(uint64_t now) {
+         (unsigned long long)(end.frame - start.frame),
+         runtime_perf_ticks_ms(end.counter - start.counter),
+         runtime_perf_ticks_ms(end.guest_work_ticks - start.guest_work_ticks),
++        (double)(end.guest_work_cycles - start.guest_work_cycles) / 1.0e6,
+         runtime_perf_ticks_ms(end.pacer_ticks - start.pacer_ticks),
+         runtime_perf_ticks_ms(end.autocapture_ticks - start.autocapture_ticks),
+         runtime_perf_ticks_ms(end.provider_poll_ticks - start.provider_poll_ticks),
+@@ -4355,15 +4380,31 @@ static void runtime_perf_frame_begin() {
+     uint64_t now = SDL_GetPerformanceCounter();
+     if (g_runtime_perf.last_frame_exit_counter &&
+         now >= g_runtime_perf.last_frame_exit_counter) {
+-        g_runtime_perf.guest_work_ticks +=
+-            now - g_runtime_perf.last_frame_exit_counter;
+-    }
++        const uint64_t work = now - g_runtime_perf.last_frame_exit_counter;
++        g_runtime_perf.guest_work_ticks += work;
++        if (work > g_runtime_perf.max_work_ticks)
++            g_runtime_perf.max_work_ticks = work;
++    }
++    if (g_runtime_perf.last_frame_begin_counter &&
++        now >= g_runtime_perf.last_frame_begin_counter) {
++        const uint64_t period = now - g_runtime_perf.last_frame_begin_counter;
++        if (period > g_runtime_perf.max_frame_ticks)
++            g_runtime_perf.max_frame_ticks = period;
++        if (period * 50u > g_runtime_perf.frequency) g_runtime_perf.frames_over_20ms++;
++        if (period * 30u > g_runtime_perf.frequency) g_runtime_perf.frames_over_33ms++;
++    }
++    g_runtime_perf.last_frame_begin_counter = now;
++    const uint64_t cycles = runtime_perf_thread_cycles();
++    if (g_runtime_perf.last_frame_exit_cycles &&
++        cycles >= g_runtime_perf.last_frame_exit_cycles)
++        g_runtime_perf.guest_work_cycles += cycles - g_runtime_perf.last_frame_exit_cycles;
+     runtime_perf_bench_tick(now);
+ }
+ 
+ static void runtime_perf_frame_end() {
+     if (!g_runtime_perf.enabled) return;
+     g_runtime_perf.last_frame_exit_counter = SDL_GetPerformanceCounter();
++    g_runtime_perf.last_frame_exit_cycles = runtime_perf_thread_cycles();
+ }
+ 
+ class RuntimePerfFrameScope {
+@@ -4502,7 +4543,8 @@ static void runtime_perf_diag_tick() {
+         "shadow=+%llu div=+%llu first_div=0x%08X "
+         "loads=+%u revalidations=+%u "
+         "load_wall=%.1f ms max=%.1f last=%.1f ms; "
+-        "capture triggers=+%u overlays=+%d last_dispatch_delta=%llu\n",
++        "capture triggers=+%u overlays=+%d last_dispatch_delta=%llu; "
++        "frame max=%.1f ms work_max=%.1f ms over20ms=%u over33ms=%u\n",
+         (double)(current.frame - last.frame) / dt,
+         (double)(audio.tap_frames[AUDIO_TAP_SPU_OUT] - last_spu) / dt,
+         fill_ms, (unsigned long long)(underruns - last_underruns),
+@@ -4537,8 +4579,15 @@ static void runtime_perf_diag_tick() {
+         (double)overlay_load_last_us / 1000.0,
+         current.capture_triggers - last.capture_triggers,
+         current.capture_overlays - last.capture_overlays,
+-        (unsigned long long)current.capture_last_dispatch_delta);
++        (unsigned long long)current.capture_last_dispatch_delta,
++        runtime_perf_ticks_ms(g_runtime_perf.max_frame_ticks),
++        runtime_perf_ticks_ms(g_runtime_perf.max_work_ticks),
++        g_runtime_perf.frames_over_20ms, g_runtime_perf.frames_over_33ms);
+     std::fflush(stdout);
++    g_runtime_perf.max_frame_ticks = 0;
++    g_runtime_perf.max_work_ticks = 0;
++    g_runtime_perf.frames_over_20ms = 0;
++    g_runtime_perf.frames_over_33ms = 0;
+     last = current;
+     last_spu = audio.tap_frames[AUDIO_TAP_SPU_OUT];
+     last_underruns = underruns;
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,76 @@
+From c35b18aa2101126bf82fd40a6e4bdb7ec42d4b7c Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 17 Oct 2026 16:30:52 +0200
+Subject: [PATCH 26/33] Widescreen: let black edge tiles cover the native-wide
+ margins
+
+Opt-in gpu_ws_set_black_edge_rects(): an opaque pure-black mono rect that
+reaches the display's left or right edge grows across that side's margin,
+so a black screen built from a grid of tiles fills the wide frame.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h |  4 ++++
+ runtime/src/gpu.c     | 24 ++++++++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 35874187..d3a9fcb5 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -283,6 +283,10 @@ void gpu_ws_tag_stretched_prim(uint32_t prim, int32_t left, int32_t right,
+                                int32_t left_anchor, int32_t right_anchor);
+ void gpu_ws_tag_tiled_strip(uint32_t prim, int32_t anchor,
+                             int32_t period, int32_t source_width);
++/* Native-wide opt-in: an opaque black untextured rect that reaches the left or
++ * right edge of the display grows across that side's margin, so a black screen
++ * built from a grid of tiles covers the wide frame. Default off. */
++void gpu_ws_set_black_edge_rects(int on);
+ 
+ /* Native-wide (mode 2) on a game frame. ws_nw_extra() is the total width the
+  * frame grows by, in display pixels (the present path widens the display read
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 499618a1..0e836d1e 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -5581,6 +5581,29 @@ static void gp0_exec_shaded_line(void) {
+     gr_draw_shaded_line(x0, y0, c0, x1, y1, c1);
+ }
+ 
++/* Title opt-in (gpu_ws_set_black_edge_rects): some games black out the screen
++ * with a grid of opaque black TILEs (Vagrant Story's opening credit cards are
++ * 5 columns of 64x15 tiles). No single tile spans the display, so
++ * ws_expand_fullscreen_rect never fires and the card stays a 4:3 box. Grow a
++ * tile that reaches the display's left or right edge across that side's
++ * native-wide margin. Only opaque pure black qualifies: semi-transparent
++ * black is a no-op on hardware, and coloured fills are left alone. */
++static int ws_black_edge_rects = 0;
++void gpu_ws_set_black_edge_rects(int on) { ws_black_edge_rects = on ? 1 : 0; }
++
++static void ws_expand_black_edge_rect(int32_t *x, int *w, uint32_t rgb,
++                                      int semi_trans) {
++    if (!ws_black_edge_rects || semi_trans || (rgb & 0xFFFFFFu) || *w <= 0)
++        return;
++    if (!ws_native_wide_active() || draw_area_wide_x_margin() <= 0) return;
++    int32_t X = ws_disp_x(), W = ws_disp_w(), off = ws_nw_offset();
++    int32_t left = *x, right = *x + *w;
++    if (left <= X && right > X) left = X - off;
++    if (right >= X + W && left < X + W) right = X + W + off;
++    *x = left;
++    *w = (int)(right - left);
++}
++
+ /* Execute mono rectangle (GP0 0x60-0x63) */
+ static void gp0_exec_mono_rect(void) {
+     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+@@ -5599,6 +5622,7 @@ static void gp0_exec_mono_rect(void) {
+         return;
+     }
+     ws_expand_fullscreen_rect(&x0, y0, &w, h);
++    ws_expand_black_edge_rect(&x0, &w, gp0_cmd_buf[0], semi_trans);
+     /* Same auto_ui squash the textured rect path gets. Without it a flat
+      * -coloured HUD mark keeps its 4:3 X while the textured primitives of the
+      * same widget move toward their anchor, so at a wide aspect it is left
+-- 
+2.54.0.windows.1
+

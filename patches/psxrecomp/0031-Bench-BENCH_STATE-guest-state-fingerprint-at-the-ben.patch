@@ -1,0 +1,98 @@
+From 7b3260fefa4866a9e7adcc935a68d2fabed327bc Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 18 Oct 2026 13:12:04 +0200
+Subject: [PATCH 31/33] Bench: [BENCH_STATE] guest-state fingerprint at the
+ bench window edges
+
+Prints the guest cycle counter and FNV-1a hashes of main RAM, VRAM and the
+GP0/GP1 command stream at the start and end frames of PSX_BENCH_WINDOW, so a
+timing or memory fast path can be checked as behaviour-identical against the
+build before it (two runs from the same savestate print the same line).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu.c    |  7 +++++++
+ runtime/src/main.cpp | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 15cda31b..a83e4f6b 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -7677,7 +7677,13 @@ static void gpu_write_gp0_body(uint32_t val) {
+  * rasterization / batching / VRAM transfer work on the emu thread — as its
+  * own phase so it is separable from the guest code that issued the write.
+  * Covers both the MMIO store chokepoint and DMA channel-2 feeds. */
++/* Running hash of every GP0/GP1 word the GPU receives ([BENCH_STATE] in main.cpp):
++ * the command stream is what the renderers draw from, so equal hashes over a
++ * bench window mean equal output without reading VRAM back from the GPU. */
++uint64_t g_gpu_cmd_hash = 1469598103934665603ull;
++
+ void gpu_write_gp0(uint32_t val) {
++    g_gpu_cmd_hash = (g_gpu_cmd_hash ^ val) * 1099511628211ull;
+     extern int g_exec_phase;
+     int prev_phase = g_exec_phase;
+     g_exec_phase = 4;
+@@ -7827,6 +7833,7 @@ static void gp1_get_info(uint32_t val) {
+ }
+ 
+ void gpu_write_gp1(uint32_t val) {
++    g_gpu_cmd_hash = (g_gpu_cmd_hash ^ val ^ 0x100000000ull) * 1099511628211ull;
+     uint32_t cmd = (val >> 24) & 0x3F;
+ 
+     switch (cmd) {
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 82468417..6e04c295 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -4327,16 +4327,47 @@ static double runtime_perf_ticks_ms(uint64_t ticks) {
+     return (double)ticks * 1000.0 / (double)g_runtime_perf.frequency;
+ }
+ 
++/* [BENCH_STATE] guest-state fingerprint at the bench window's edges: the guest
++ * cycle counter and FNV-1a hashes of main RAM and VRAM. Two runs from the same
++ * savestate print the same line when the emulation is behaviour-identical, so
++ * a timing or memory fast path can be checked against the build before it.
++ * VRAM lives on the GPU under the GL renderer, so gpu_cmds (every GP0/GP1
++ * word, gpu.c) stands in for the frame output there. */
++static uint64_t bench_fnv1a(const void *data, size_t n) {
++    const uint8_t *p = (const uint8_t *)data;
++    uint64_t h = 1469598103934665603ull;
++    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++extern "C" {
++    extern uint8_t *g_psx_ram;
++    extern uint32_t g_psx_ram_size;
++    uint16_t *gpu_get_vram_ptr(void);
++    uint32_t gpu_get_vram_bytes(void);
++    extern uint64_t g_gpu_cmd_hash;
++}
++
++static void runtime_perf_bench_state(const char *edge) {
++    std::fprintf(stdout, "[BENCH_STATE] %s frame=%llu guest_cycles=%llu ram=%016llx vram=%016llx gpu_cmds=%016llx\n",
++                 edge, (unsigned long long)s_frame_count, (unsigned long long)psx_cycle_count,
++                 (unsigned long long)bench_fnv1a(g_psx_ram, g_psx_ram_size),
++                 (unsigned long long)bench_fnv1a(gpu_get_vram_ptr(), gpu_get_vram_bytes()),
++                 (unsigned long long)g_gpu_cmd_hash);
++}
++
+ static void runtime_perf_bench_tick(uint64_t now) {
+     if (!g_runtime_perf.bench_configured || g_runtime_perf.bench_reported) return;
+     if (!g_runtime_perf.bench_started) {
+         if (s_frame_count == g_runtime_perf.bench_start_frame) {
+             g_runtime_perf.bench_start = runtime_perf_snapshot(now);
+             g_runtime_perf.bench_started = true;
++            runtime_perf_bench_state("start");
+         }
+         return;
+     }
+     if (s_frame_count != g_runtime_perf.bench_end_frame) return;
++    runtime_perf_bench_state("end");
+ 
+     RuntimePerfSnapshot end = runtime_perf_snapshot(now);
+     const RuntimePerfSnapshot &start = g_runtime_perf.bench_start;
+-- 
+2.54.0.windows.1
+

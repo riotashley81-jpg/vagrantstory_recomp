@@ -1,0 +1,94 @@
+From 629c38c0996e1b088fcaa08a0d8ef598c4b9f02b Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 18 Oct 2026 14:23:15 +0200
+Subject: [PATCH 32/33] DMA: skip the redundant device service per GPU
+ linked-list packet
+
+hold_cpu_for_gpu_linked_list advanced to each packet event and then called
+psx_devices_service_to_now() again. The advance lands on the packet event,
+which is the service deadline, so it has already serviced the devices; the
+second call only recomputed the same deadline from unchanged state (six
+device queries per packet). psx_devices_service_current() reports that case
+and the hold loop skips the call.
+
+Behaviour-identical: [BENCH_STATE] guest cycles, RAM and GP0/GP1 stream hashes
+match the previous build over 1200 frames from savestates 9 and 1 (3 runs
+each). Opening cutscene (MSVC Release): host cycles -1.3%, heavy-vblank work
+16.3 -> 15.4 ms; slot 1 cutscene -2.4%, 16.9 -> 15.6 ms.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/dma.c                          | 10 +++++++++-
+ runtime/src/psx_cycles.c                   | 11 +++++++++++
+ runtime/tests/test_dma_gpu_list_cpu_hold.c |  5 +++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/dma.c b/runtime/src/dma.c
+index b60d8add..bfda5c3e 100644
+--- a/runtime/src/dma.c
++++ b/runtime/src/dma.c
+@@ -823,6 +823,9 @@ static void start_async_gpu_linked_list(void) {
+  * whole walk (and the GPU work it feeds) with in_exception set, which is what
+  * the phase profiler's exc_share then measures. */
+ extern int psx_get_in_exception(void);
++/* psx_cycles.c; declared here, not in psx_cycles.h, because that header is a
++ * codegen-hash source and this helper is runtime-only. */
++extern int psx_devices_service_current(void);
+ static DMAGpuHoldEntry s_hold_ring[DMA_GPU_HOLD_RING_CAP];
+ static DMAGpuHoldStats s_hold_stats;
+ 
+@@ -854,7 +857,12 @@ static void hold_cpu_for_gpu_linked_list(void) {
+            channel_enabled(2)) {
+         const uint32_t moved = gpu_linked_list.total_words;
+         psx_advance_cycles(dma_gpu_ll_cycles_to_event(&gpu_linked_list));
+-        psx_devices_service_to_now();
++        /* The advance reaches the packet event, which is the service deadline,
++         * so it has normally serviced the devices already; a second service
++         * would only recompute the same deadline (six device queries per
++         * packet). */
++        if (!psx_devices_service_current())
++            psx_devices_service_to_now();
+         steps++;
+         if (gpu_linked_list.active && gpu_linked_list.total_words == moved) break;
+     }
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 5fd078ff..0e5e91a2 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -403,6 +403,17 @@ void psx_devices_service_to_now(void) {
+     }
+ }
+ 
++/* True when every device is already serviced up to the current cycle and the
++ * deadline is armed, so psx_devices_service_to_now() would only recompute the
++ * same deadline from unchanged device state. dma.c's GPU linked-list hold asks
++ * this after each per-packet psx_advance_cycles(), which normally lands exactly
++ * on the packet event and services it already. */
++int psx_devices_service_current(void) {
++    return !g_psx_guest_time_frozen && !s_in_device_service &&
++           s_devices_synced_cycle == psx_cycle_count &&
++           psx_next_service_cycle != 0;
++}
++
+ /* memory.c hook: called at the top of every device-MMIO read/write wrapper.
+  * Catch devices up so the handler sees current state, then recompute the
+  * deadline immediately (a write may re-arm a shorter event). Previously this
+diff --git a/runtime/tests/test_dma_gpu_list_cpu_hold.c b/runtime/tests/test_dma_gpu_list_cpu_hold.c
+index 02c2ce70..00b9a955 100644
+--- a/runtime/tests/test_dma_gpu_list_cpu_hold.c
++++ b/runtime/tests/test_dma_gpu_list_cpu_hold.c
+@@ -55,6 +55,11 @@ void psx_advance_cycles_slow(uint32_t cycles) {
+     psx_cycle_count += cycles;
+     psx_devices_service_to_now();
+ }
++/* Same contract as psx_cycles.c: serviced up to now with the deadline armed. */
++int psx_devices_service_current(void) {
++    return !psx_in_device_service && s_serviced_to == psx_cycle_count &&
++           psx_next_service_cycle != 0;
++}
+ 
+ /* ---- memory ------------------------------------------------------------- */
+ uint32_t g_psx_ram_size = 0x00200000u;
+-- 
+2.54.0.windows.1
+
