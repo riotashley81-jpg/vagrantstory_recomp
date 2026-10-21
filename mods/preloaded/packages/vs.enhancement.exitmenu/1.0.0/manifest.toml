@@ -1,0 +1,22 @@
+format_version = 5
+id = "vs.enhancement.exitmenu"
+version = "1.0.0"
+name = "Exit Options"
+author = "VagrantStoryRecomp"
+description = "Adds Exit to Main Menu and Exit Game to the in-game menu, and Exit Game to the title screen."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "exitmenu"
+name = "Exit Options"
+description = "Exit to Main Menu and Exit Game in the Triangle menu; Exit Game on the title screen."
+group = "Interface"
+default_enabled = true
+
+[[plugin]]
+feature = "exitmenu"
+id = "vs.exitmenu"

@@ -51,6 +51,8 @@ launcher's Mods page:
   R3 still toggles first-person view; there the right stick (or D-pad)
   looks around, up is up, and the left stick returns to the normal camera.
 - **Skippable boot logos**: Enter, Circle or Start skips the company logos.
+- **Exit options**: Exit to Main Menu and Exit Game in the Triangle menu
+  (press Circle twice to confirm), and Exit Game on the title screen.
 - The Windows Volume Mixer lists the game by name with its icon.
 - Keyboard default: Space is Jump.
 
@@ -69,7 +71,7 @@ thread come from psxrecomp and are set in the launcher's Display settings.
 | Path | What it is |
 |---|---|
 | `game.toml` | Title config for the recompiler and runtime |
-| `src/` | This port's runtime plugins (widescreen, prompts, stick camera, logo skip) |
+| `src/` | This port's runtime plugins (widescreen, prompts, stick camera, logo skip, exit options) |
 | `mods/` | The mod packages that expose those features in the launcher |
 | `patches/psxrecomp`, `patches/recomp-ui` | Changes to the two framework submodules |
 | `scripts/apply_patches.*` | Applies those patches on a local branch |

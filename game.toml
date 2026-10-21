@@ -33,8 +33,13 @@ known_crc32 = [
 seeds = "seeds/ghidra_funcs.txt"
 out_dir = "generated"
 strict = true
-# Mod instruction hooks (overlay code; see src/vs_skip_logos.c).
-mod_instruction_sites = ["0x8006F6EC"]
+# Mod instruction hooks (overlay code; see src/vs_skip_logos.c and, for the
+# title screen's Exit Game entry, src/vs_exit_menu.c).
+mod_instruction_sites = ["0x8006F6EC",
+  "0x8006FC3C", "0x8007156C", "0x8007163C", "0x80071640",
+  "0x80071684", "0x800716C4", "0x80070EBC", "0x80071144"]
+# Function filters (src/vs_exit_menu.c: the in-game menu list, BATTLE.PRG).
+mod_function_entry_funcs = ["0x800C930C"]
 
 [runtime]
 window_title = "VagrantStory Recompiled"
