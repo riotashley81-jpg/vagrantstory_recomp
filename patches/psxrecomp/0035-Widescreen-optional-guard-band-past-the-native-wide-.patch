@@ -1,0 +1,188 @@
+From 6555c89054eb1cd1c8202dcaeff4d69e92a2d304 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 22 Oct 2026 14:24:43 +0200
+Subject: [PATCH] Widescreen: optional guard band past the native-wide edges
+
+Opt-in gpu_ws_set_present_guard() + gl_renderer_set_wide_guard(): the
+native-wide surface and the game's widened cull reach N native pixels
+past each visible side edge, and present crops them away. Smooth
+motion's in-between frames then find real picture where the moved
+camera uncovers the screen edge, instead of a pasted strip of the newer
+frame a step of motion off (a seam with a shifted picture past it).
+GL only; local-viewport (netplay) layouts are left alone.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h             |  2 ++
+ runtime/include/gpu_gl_renderer.h |  3 +++
+ runtime/src/gpu.c                 | 33 ++++++++++++++++++++++++++-----
+ runtime/src/gpu_gl_renderer.c     | 25 +++++++++++++++++------
+ 4 files changed, 52 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 235eeede..01d2b26f 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -483,6 +483,8 @@ void gpu_ws_set_gameplay_state_gate(uint32_t addr,
+  * layer the game composites back onto the screen keeps its reveal margins.
+  * x < 0 turns it off. */
+ void gpu_ws_set_aux_target(int x, int y);
++/* Native-wide guard band past each visible edge, cropped at present (local patch). */
++void gpu_ws_set_present_guard(int pixels);
+ void gpu_ws_set_local_viewport_state_gate(uint32_t addr,
+                                           const uint32_t *values, int nvalues);
+ /* Native-wide HUD corner re-anchoring ([widescreen] nw_hud_corners): push
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 506498a6..81f013c9 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -290,6 +290,9 @@ void gl_renderer_set_wide_fast(int on);
+  * by the display width into the reveal margins, reading the source's own wide
+  * margins there. Up to 4 sources; x < 0 removes them all. */
+ void gl_renderer_set_wide_aux(int x, int y, int h, int needs_fresh);
++/* Native-wide guard band: crop this many native px per side at present
++ * (local patch; pairs with gpu_ws_set_present_guard). */
++void gl_renderer_set_wide_guard(int px);
+ /* PGXP renderer features (docs/ENHANCEMENTS.md G1.14), all off by default:
+  * depth buffer for opaque 3D polygons, perspective-correct Gouraud colour,
+  * seam expansion (0 off, 1 = 1 output px above 1x, 2 = 0.5 native px),
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index ce68b879..268a734b 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -645,6 +645,28 @@ static int ws_nw_offset(void) {
+ int gpu_ws_configured_x_reveal(void) { return ws_nw_configured_offset(); }
+ int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
+ 
++/* Native-wide guard band (opt-in, gpu_ws_set_present_guard): the wide surface
++ * reaches this many native pixels past each visible edge and the game's cull
++ * is widened to fill it, but present crops it away
++ * (gl_renderer_set_wide_guard). Smooth motion's in-between frames then have
++ * real picture where the moved camera uncovers the screen edge. GL only. */
++static int ws_nw_guard_cfg = 0;
++void gpu_ws_set_present_guard(int pixels) {
++    if (pixels < 0) pixels = 0;
++    if (pixels > 64) pixels = 64;
++    ws_nw_guard_cfg = pixels;
++}
++static int ws_nw_guard(void) {
++    if (ws_nw_guard_cfg <= 0 || gr_backend() != GR_BACKEND_OPENGL) return 0;
++    if (ws_local_viewport_layout(NULL, NULL, NULL, NULL)) return 0;
++    return ws_nw_guard_cfg;
++}
++/* The surface's margin per side: the visible reveal plus the guard band. */
++static int ws_nw_surface_offset(void) {
++    const int off = ws_nw_offset();
++    return off > 0 ? off + ws_nw_guard() : 0;
++}
++
+ static uint32_t ws_view_camera_addr, ws_view_min_addr, ws_view_max_addr, ws_view_active_addr;
+ static int ws_view_bounds_override, ws_view_bounds_min, ws_view_bounds_max;
+ static WsViewAnchor ws_view;
+@@ -1492,7 +1514,7 @@ int psx_ws_x_margin(void) {
+         /* A constant envelope covers both possible edge origins. Do not shrink
+          * actor activation as the view slides, or prebuilt spawn lists go stale. */
+         return ws_nw_configured_offset() * (ws_view_camera_addr ? 2 : 1)
+-               + ws_cull_guard_pixels;
++               + ws_cull_guard_pixels + ws_nw_guard();
+     if (!ws_active()) return 0;
+     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum
+            + ws_cull_guard_pixels;
+@@ -3629,7 +3651,8 @@ static void ws_nw_sync_target(void) {
+         gr_wide_set_view(0, 0, 0, 0);
+         gr_wide_disable_target(); return;
+     }
+-    gr_wide_configure(ws_nw_present_width(), ws_nw_offset());
++    gr_wide_configure(ws_nw_present_width() + 2 * (ws_nw_surface_offset() - ws_nw_offset()),
++                      ws_nw_surface_offset());
+     if (ws_aux_draw_target()) {   /* offscreen layer with margins */
+         gr_wide_set_target(ws_aux_x);
+         return;
+@@ -4821,10 +4844,10 @@ static inline int32_t draw_area_wide_x_margin(void) {
+     int local_base = 0;
+     if (!ws_native_wide_active()) return 0;
+     if (ws_local_viewport_draw_target(&local_base)) return (int32_t)ws_nw_offset();
+-    if (ws_display_viewport_draw_target(NULL)) return (int32_t)ws_nw_offset();
+-    if (ws_aux_draw_target()) return (int32_t)ws_nw_offset();   /* local patch */
++    if (ws_display_viewport_draw_target(NULL)) return (int32_t)ws_nw_surface_offset();
++    if (ws_aux_draw_target()) return (int32_t)ws_nw_surface_offset();   /* local patch */
+     if (!ws_is_fb_base(draw_area_left)) return 0;
+-    return (int32_t)ws_nw_offset();
++    return (int32_t)ws_nw_surface_offset();
+ }
+ 
+ static inline void draw_area_host_x_bounds(int32_t *left, int32_t *right) {
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index df7726f2..1927c2f8 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -3287,6 +3287,16 @@ static int bd_prim_gate(const int *xs, int n, int textured) {
+ static int s_wide_fast = 1;
+ void gl_renderer_set_wide_fast(int on) {
+     GL_RT_SYNC("set_wide_fast"); s_wide_fast = on ? 1 : 0; }
++/* Native-wide guard band (gpu_ws_set_present_guard): the surface reaches this
++ * many native pixels past each visible edge; present crops them away. */
++static int s_wide_guard = 0;
++void gl_renderer_set_wide_guard(int px) {
++    GL_RT_SYNC("set_wide_guard"); s_wide_guard = px > 0 ? px : 0; }
++/* The presented columns of the wide surface: [wide_vis_x(), +wide_vis_w()). */
++static int wide_vis_x(void) {
++    return (g_wide_off > s_wide_guard && g_wide_w > 4 * s_wide_guard) ? s_wide_guard : 0;
++}
++static int wide_vis_w(void) { return g_wide_w - 2 * wide_vis_x(); }
+ void gl_renderer_set_wide_aux(int x, int y, int h, int needs_fresh) {
+     GL_RT_SYNC("set_wide_aux");
+     if (x < 0) { s_auxs_n = 0; return; }
+@@ -7182,11 +7192,14 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
+     if (ry0 + out_h > H) out_h = H - ry0;
+     if (out_h <= 0) return 0;
+ 
++    /* Only the presented columns (the guard band is cropped). */
++    const int rx0 = wide_vis_x() * s_out_scale;
++    W = wide_vis_w() * s_out_scale;
+     uint32_t *tmp = (uint32_t *)malloc((size_t)W * out_h * sizeof(uint32_t));
+     if (!tmp) return 0;
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+     glPixelStorei(GL_PACK_ALIGNMENT, 4);
+-    glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
++    glReadPixels(rx0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+ 
+     /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
+@@ -10219,11 +10232,11 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
+         glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+     }
+     int interp_pair = interp_capture(
+-        fbo, 0, disp_y, g_wide_w, disp_h, linear, 0, GL_PRES_WIDE,
++        fbo, wide_vis_x(), disp_y, wide_vis_w(), disp_h, linear, 0, GL_PRES_WIDE,
+         disp_x, disp_y,
+         present_dirty_test(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1));
+     if (interp_pair) {
+-        hold_capture_native_fbo(fbo, 0, disp_y, g_wide_w, disp_h, 0, linear);
++        hold_capture_native_fbo(fbo, wide_vis_x(), disp_y, wide_vis_w(), disp_h, 0, linear);
+         interp_present_source_interval();
+         gl_perf_present_exit(1);
+         present_dirty_rect(0, disp_y, VRAM_W - 1, disp_y + disp_h - 1, 0);
+@@ -10237,7 +10250,7 @@ static int present_wide_fbo_impl(int disp_x, int disp_y, int disp_h, int linear)
+     const float wext = (wide_as > s_out_scale && s_out_scale >= 1)
+                            ? (float)wide_as / (float)s_out_scale : 1.0f;
+     present_target_quad(tex, (float)g_wide_w * wext, (float)VRAM_H * wext,
+-                        0, disp_y, g_wide_w, disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
++                        wide_vis_x(), disp_y, wide_vis_w(), disp_h, linear, lx, ly, lw, lh, 1, 1, s_out_scale);
+     pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
+     gpu_timeline_note(GTL_PRESENT, GTL_PATH_WIDE_FBO,
+                       (uint32_t)disp_x | ((uint32_t)disp_y << 16));
+@@ -12145,8 +12158,8 @@ static void fg_compose(const FgList *b, GLuint wide_fbo, GLuint wide_tex, int li
+         glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+     }
+     if (b->wide) {
+-        present_target_quad(wide_tex, (float)g_wide_w, (float)VRAM_H, 0, b->disp[1], g_wide_w,
+-                            b->disp[3], linear, lx, ly, lw, lh, 1, 1, s_out_scale);
++        present_target_quad(wide_tex, (float)g_wide_w, (float)VRAM_H, wide_vis_x(), b->disp[1],
++                            wide_vis_w(), b->disp[3], linear, lx, ly, lw, lh, 1, 1, s_out_scale);
+     } else {
+         present_bezel(ww, wh, lx, ly, lw, lh);
+         present_target_quad(s_hr_tex, (float)VRAM_W, (float)VRAM_H, b->disp[0], b->disp[1],
+-- 
+2.54.0.windows.1
+

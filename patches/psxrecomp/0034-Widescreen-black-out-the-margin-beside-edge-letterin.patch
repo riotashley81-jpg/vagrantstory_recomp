@@ -1,0 +1,94 @@
+From 351fd98fad2f2a3c1fd9a96a61eb9e42ab9d8ee0 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Tue, 20 Oct 2026 22:53:58 +0200
+Subject: [PATCH] Widescreen: black out the margin beside edge lettering cells
+ of a card
+
+A credit card's grid holds its lettering as neutral sprites the size of
+the black tiles. Where such a cell is the first or last of its row (a
+long name reaching the left column, the title logo on both sides) no tile
+grew across that margin and the scene behind the card showed through as
+a hole. While edge tiles of the same size are being grown, paint the
+margin beside such a sprite black too.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu.c | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index a83e4f6b..ce68b879 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -5685,9 +5685,11 @@ static void gp0_exec_shaded_line(void) {
+  * native-wide margin. Only opaque pure black qualifies: semi-transparent
+  * black is a no-op on hardware, and coloured fills are left alone. */
+ static int ws_black_edge_rects = 0;
++static uint32_t ws_black_edge_frame = UINT32_MAX;
++static int ws_black_edge_tile_w = 0, ws_black_edge_tile_h = 0;
+ void gpu_ws_set_black_edge_rects(int on) { ws_black_edge_rects = on ? 1 : 0; }
+ 
+-static void ws_expand_black_edge_rect(int32_t *x, int *w, uint32_t rgb,
++static void ws_expand_black_edge_rect(int32_t *x, int *w, int h, uint32_t rgb,
+                                       int semi_trans) {
+     if (!ws_black_edge_rects || semi_trans || (rgb & 0xFFFFFFu) || *w <= 0)
+         return;
+@@ -5696,10 +5698,38 @@ static void ws_expand_black_edge_rect(int32_t *x, int *w, uint32_t rgb,
+     int32_t left = *x, right = *x + *w;
+     if (left <= X && right > X) left = X - off;
+     if (right >= X + W && left < X + W) right = X + W + off;
++    if (left != *x || right != *x + *w) {
++        ws_black_edge_frame = (uint32_t)s_frame_count;
++        ws_black_edge_tile_w = *w;
++        ws_black_edge_tile_h = h;
++    }
+     *x = left;
+     *w = (int)(right - left);
+ }
+ 
++/* The card's lettering sits in the same grid: a cell holding text is a
++ * neutral sprite of the tile's size instead of a black tile. Where such a
++ * cell is the first or last of its row (long names reach the left column,
++ * the title logo both) nothing grew across that margin and the scene behind
++ * the card showed through. Paint the margin black for it, as a tile would.
++ * Only while edge tiles of the same size are being grown (a card is up). */
++static void ws_black_edge_sprite(int32_t x, int32_t y, int w, int h,
++                                 uint32_t color24, int semi_trans) {
++    if (!ws_black_edge_rects || semi_trans || color24 != 0x808080u) return;
++    if (w != ws_black_edge_tile_w || h != ws_black_edge_tile_h || w <= 0) return;
++    if ((uint32_t)s_frame_count - ws_black_edge_frame > 2u) return;
++    if (!ws_native_wide_active() || draw_area_wide_x_margin() <= 0) return;
++    int32_t X = ws_disp_x(), W = ws_disp_w(), off = ws_nw_offset();
++    int32_t a = INT32_MIN, b = INT32_MIN;
++    if (x <= X && x + w > X) { a = X - off; b = x; }
++    else if (x + w >= X + W && x < X + W) { a = x + w; b = X + W + off; }
++    if (b <= a) return;
++    int32_t px = a + draw_offset_x, py = y + draw_offset_y;
++    if (draw_area_out_rect(px, py, (int)(b - a), h)) return;
++    gr_set_semi_transparency(0, (int)semi_transparency);
++    gr_draw_flat_rect(px, py, (int)(b - a), h, 0);
++}
++
+ /* Execute mono rectangle (GP0 0x60-0x63) */
+ static void gp0_exec_mono_rect(void) {
+     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+@@ -5718,7 +5748,7 @@ static void gp0_exec_mono_rect(void) {
+         return;
+     }
+     ws_expand_fullscreen_rect(&x0, y0, &w, h);
+-    ws_expand_black_edge_rect(&x0, &w, gp0_cmd_buf[0], semi_trans);
++    ws_expand_black_edge_rect(&x0, &w, h, gp0_cmd_buf[0], semi_trans);
+     /* Same auto_ui squash the textured rect path gets. Without it a flat
+      * -coloured HUD mark keeps its 4:3 X while the textured primitives of the
+      * same widget move toward their anchor, so at a wide aspect it is left
+@@ -5785,6 +5815,7 @@ static void gp0_exec_textured_rect(void) {
+     if (w > 1023) w = 1023;
+     if (h > 511)  h = 511;
+     if (ws_row_wipe_sprite(&x0, &u0, &w, y0, h, color24)) return;
++    ws_black_edge_sprite(x0, y0, w, h, color24, semi_trans);
+     ws_clear_tagged_rect_reveal(y0 + draw_offset_y, h);
+ 
+     const WsTag *tile_tag = ws_screen_tag();
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,60 @@
+From f7c677074cadbfa72db496f6861c091cb103bac7 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 22 Oct 2026 15:21:09 +0200
+Subject: [PATCH] Smooth motion: no newer-frame strips along the top and bottom
+ edges
+
+The game draws the polygons that cross the top and bottom of the screen
+(only the draw area clips them), so the moved redraw already fills what
+the in-between camera uncovers there. Pasting the newer frame's rows on
+top -- a whole step of motion off -- showed as a seam with a shifted
+picture past it along the top and bottom of every in-between frame while
+the camera moved. Only the left and right strips are pasted now.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 17 ++++++++---------
+ 1 file changed, 8 insertions(+), 9 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 1927c2f8..3dff29d3 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -12785,9 +12785,13 @@ static int fg_generate(double t, int swap) {
+     flush_line_batch();
+     flush_flat_batch();
+     flush_tex_batch();
+-    /* The strips along a view's edges the picture moved away from: the
+-     * newer frame drew nothing beyond the edge, so they show it. On the
+-     * native-wide surface native x maps to x + wide_off. */
++    /* The strips along a view's left and right edges the picture moved away
++     * from: the newer frame drew nothing beyond the edge, so they show it.
++     * Not the top and bottom: the game draws the polygons crossing those
++     * edges (only the draw area clips them), so the moved redraw already
++     * fills what the camera uncovers there, and the newer frame's rows -- a
++     * whole step of motion off -- showed as a seam with a shifted picture
++     * past it. On the native-wide surface native x maps to x + wide_off. */
+     {
+         const int ox = iw >= 0 ? L->wide_off : 0, sw = iw >= 0 ? g_wide_w : L->disp[2];
+         const GLuint src = iw >= 0 ? wf : f0, dst = iw >= 0 ? s_fg_w_fbo : s_fg_hr_fbo;
+@@ -12802,16 +12806,11 @@ static int fg_generate(double t, int swap) {
+             if (y2 > ly + lh) y2 = ly + lh;
+             if (x2 <= x1 || y2 <= y1) continue;
+             const int w = x2 - x1, h = y2 - y1;
+-            int ml = m[0] > 0 ? (int)ceilf(m[0]) + 1 : 0, mt = m[1] > 0 ? (int)ceilf(m[1]) + 1 : 0;
+-            int mr = m[2] > 0 ? (int)ceilf(m[2]) + 1 : 0, mb = m[3] > 0 ? (int)ceilf(m[3]) + 1 : 0;
++            int ml = m[0] > 0 ? (int)ceilf(m[0]) + 1 : 0, mr = m[2] > 0 ? (int)ceilf(m[2]) + 1 : 0;
+             if (ml > w) ml = w;
+             if (mr > w) mr = w;
+-            if (mt > h) mt = h;
+-            if (mb > h) mb = h;
+             if (ml) fg_blit2(src, dst, (bx0 + x1) * S, (y1 + sdy) * S, (bx0 + x1) * S, y1 * S, ml * S, h * S);
+             if (mr) fg_blit2(src, dst, (bx0 + x2 - mr) * S, (y1 + sdy) * S, (bx0 + x2 - mr) * S, y1 * S, mr * S, h * S);
+-            if (mt) fg_blit2(src, dst, (bx0 + x1) * S, (y1 + sdy) * S, (bx0 + x1) * S, y1 * S, w * S, mt * S);
+-            if (mb) fg_blit2(src, dst, (bx0 + x1) * S, (y2 - mb + sdy) * S, (bx0 + x1) * S, (y2 - mb) * S, w * S, mb * S);
+         }
+     }
+     s_fg_reprojected_now = reproj;
+-- 
+2.54.0.windows.1
+

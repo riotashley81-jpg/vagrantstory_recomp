@@ -52,6 +52,11 @@ static void vs_widescreen_activate(void) {
     /* Each card wipes in and out one scanline at a time; stretch the wipe
      * across the wide frame too. */
     gpu_ws_set_row_wipe(1);
+    /* Render 16 native pixels past each side edge and crop them at present:
+     * Smooth motion's in-between frames then have real picture where the
+     * moved camera uncovers the screen edge, instead of a seam. */
+    gpu_ws_set_present_guard(16);
+    gl_renderer_set_wide_guard(16);
 
     fprintf(stdout, "vagrantstory: widescreen %s (HUD %s)\n",
             aspect[0] ? aspect : "16:9", hud[0] ? hud : "original");
