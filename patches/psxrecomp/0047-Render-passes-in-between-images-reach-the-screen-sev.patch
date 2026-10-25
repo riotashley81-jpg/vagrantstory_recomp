@@ -1,0 +1,807 @@
+From 188c26896cf93a8bbbf427b428798bcb2158e67f Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 20:01:40 +0200
+Subject: [PATCH] Render passes: in-between images reach the screen; several
+ pass workers
+
+Presents of a pass generation were timed from the interval that promoted
+it, one VBlank before the frame start the passes were planned for: the
+first present already read phase 0.5 and showed the in-between image, the
+next held it, and the game's own frame never reached the screen (image
+pairs A' A' B' B'). Generations now keep the plan's frame start and length
+and are presented by them.
+
+The planner placed frames with the guest's 59.94 Hz VBlank length while a
+presenter locked to the display runs whole refreshes, so the deadlines
+drifted until they read as phase 0.998; and a deadline at the frame's end
+(which shows the next game frame) was planned as an in-between image. The
+plan now uses the schedule's own VBlank length and skips the frame's end.
+
+Pass worker: psx_mod_pass_worker_start(count) runs up to 4 helper
+processes, slot-addressed, so a title can build several in-between frames
+of one game frame at once. A result is now read only for its own job
+sequence (a stale done event made about 2% of single-helper results, and
+40% with three, read as failed), helpers starting together no longer race
+on the mod state file (per-process temp name), and failures carry a reason
+(pass_worker_stats failed_why).
+
+psx_mod_render_pass_present_slack_ms and psx_mod_set_render_pass_present_hook
+let a title add late passes right before the present they are due for.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu_gl_renderer.h     |   2 +
+ runtime/include/mod_plugins.h         |  37 +++-
+ runtime/src/debug_server.c            |   6 +-
+ runtime/src/gpu_gl_renderer.c         |  60 +++++-
+ runtime/src/mod_packages.cpp          |  14 +-
+ runtime/src/pass_worker.c             | 300 ++++++++++++++++----------
+ runtime/src/render_pass.c             |   8 +
+ runtime/src/render_pass_plan.c        |   4 +-
+ runtime/tests/test_render_pass_plan.c |  23 ++
+ 9 files changed, 325 insertions(+), 129 deletions(-)
+
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 286b9ddf..94dec44a 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -98,6 +98,8 @@ int      gl_renderer_pass_verify_vram(void);
+ void     gl_renderer_pass_note_cost(uint64_t ticks);
+ /* Present output deadlines that fell due while guest code ran. */
+ void     gl_renderer_pass_service_presents(void);
++double   gl_renderer_pass_present_slack_ms(void);
++void     gl_renderer_pass_set_present_hook(void (*fn)(void));
+ /* promotions, presents, blended presents, expired, unmatched flips, presents
+  * made between VBlanks, smoothed pass cost (us), images in the shown frame,
+  * presents past the frame's planned end (the next flip was late; the newest
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index 49eed983..2b4fa159 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -787,6 +787,15 @@ int psx_mod_run_guest_span(struct CPUState* cpu, uint32_t start_pc,
+ int psx_mod_render_pass_open(const PSXModRenderPass* rect);
+ int psx_mod_render_pass_late(struct CPUState* cpu, const PSXModRenderPass* pass,
+                              PSXModRenderPassFn fn, void* user);
++/* Milliseconds until the presenter's next output deadline (0 when passes are
++ * unavailable or it is due): how long a VBlank hook may wait for a late
++ * pass's input without delaying a present. */
++double psx_mod_render_pass_present_slack_ms(void);
++/* Run fn before each scheduled present while passes are presented (NULL
++ * clears it): a title adds late passes there whose input arrived since the
++ * last present, e.g. a pass worker's images at more than one present per
++ * VBlank. Inside it, the slack is to the present about to be made. */
++void psx_mod_set_render_pass_present_hook(PSXModVBlankCallback fn);
+ 
+ /*
+  * Render-pass worker (pass_worker.c, Windows): a second copy of the
+@@ -799,8 +808,11 @@ int psx_mod_render_pass_late(struct CPUState* cpu, const PSXModRenderPass* pass,
+  * the same state; the pass then submits the result to the GPU.
+  *
+  * The job function is registered in both processes (a constructor); in the
+- * helper it runs with g_psx_render_pass_active set, like a pass. Only one job
+- * is out at a time. Every call returns 0 when the worker is unavailable
++ * helper it runs with g_psx_render_pass_active set, like a pass.
++ * psx_mod_pass_worker_start(count) starts up to 4 helpers (slots 0..n-1, it
++ * returns n); each slot has at most one job out, so a title can build several
++ * in-between frames of one game frame at once on different cores. Every call
++ * returns 0 when the worker is unavailable
+  * (another platform, a session with more than 2 MiB of RAM, the helper
+  * exited); the title then runs its passes in-process.
+  */
+@@ -818,19 +830,22 @@ typedef struct PSXModPassWorkerStats {
+     uint64_t submitted, done, late, failed;
+     double last_job_ms;
+     uint32_t last_pages, last_pgxp;
+-    int running, failed_session;
++    int running, failed_session;   /* running: helpers alive */
++    uint32_t workers;              /* helpers started */
++    uint64_t failed_why[3];        /* failed: job, RAM pages, PGXP overflow */
+ } PSXModPassWorkerStats;
+ int psx_mod_pass_worker_set_job(PSXModPassWorkerJob job);
+ int psx_mod_pass_worker_is_helper(void);
+-int psx_mod_pass_worker_start(void);
+-int psx_mod_pass_worker_submit(const PSXModPassWorkerState* state,
++uint32_t psx_mod_pass_worker_start(uint32_t count);
++uint32_t psx_mod_pass_worker_count(void);
++int psx_mod_pass_worker_submit(uint32_t slot, const PSXModPassWorkerState* state,
+                                const void* user, uint32_t len);
+-/* 1 when the job is done and its result kept, waiting up to wait_ms. */
+-int psx_mod_pass_worker_result(uint32_t wait_ms);
+-int psx_mod_pass_worker_pending(void);
+-/* The helper has started and serves jobs (it takes a moment after start). */
+-int psx_mod_pass_worker_ready(void);
+-int psx_mod_pass_worker_apply(void);
++/* 1 when the slot's job is done and its result kept, waiting up to wait_ms. */
++int psx_mod_pass_worker_result(uint32_t slot, uint32_t wait_ms);
++int psx_mod_pass_worker_pending(uint32_t slot);
++/* The slot's helper has started and serves jobs (it takes a moment). */
++int psx_mod_pass_worker_ready(uint32_t slot);
++int psx_mod_pass_worker_apply(uint32_t slot);
+ void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats* out);
+ /*
+  * Declare the back-edge PC of the game's own wait-for-VBlank loop (the resume
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 94177611..058a5ee8 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8878,10 +8878,12 @@ static void handle_pass_worker_stats(int id, const char *json)
+     send_fmt("{\"id\":%d,\"ok\":true,\"submitted\":%llu,\"done\":%llu,"
+              "\"late\":%llu,\"failed\":%llu,\"last_job_ms\":%.3f,"
+              "\"last_pages\":%u,\"last_pgxp\":%u,\"running\":%d,"
+-             "\"failed_session\":%d}", id,
++             "\"failed_session\":%d,\"workers\":%u,\"failed_why\":[%llu,%llu,%llu]}", id,
+              (unsigned long long)w.submitted, (unsigned long long)w.done,
+              (unsigned long long)w.late, (unsigned long long)w.failed,
+-             w.last_job_ms, w.last_pages, w.last_pgxp, w.running, w.failed_session);
++             w.last_job_ms, w.last_pages, w.last_pgxp, w.running, w.failed_session,
++             w.workers, (unsigned long long)w.failed_why[0],
++             (unsigned long long)w.failed_why[1], (unsigned long long)w.failed_why[2]);
+ }
+ 
+ /* render_pass_refuse on=<0|1>: make the OpenGL backend decline render passes
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 70f00d94..92ad1c00 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -668,6 +668,7 @@ static void pass_note_new_frame(int origin_x, int origin_y, int source_path,
+                                 int pw, int ph);
+ static void pass_apply_promotion(void);
+ static int pass_gen_present(uint64_t deadline);
++static void pass_run_present_hook(uint64_t deadline);
+ static int stereo_present(int w, int h);
+ static void stereo_resources_release(void);
+ static void stereo_invalidate(void);
+@@ -7856,6 +7857,7 @@ static void interp_present_source_interval(void) {
+     while (frame_interpolation_schedule_next(
+                &s_interp_schedule, SDL_GetPerformanceCounter(),
+                &deadline, &alpha)) {
++        pass_run_present_hook(deadline);
+         interp_wait_until(deadline, frequency);
+         present_pacing_note_deadline(deadline);
+         latency_ring_mark(LAT_SWAP_BEGIN);
+@@ -7918,7 +7920,11 @@ typedef struct PassGen {
+     uint32_t period;              /* guest VBlanks the frame stays on screen */
+     int      shown;               /* built for a frame already on screen */
+     double   t_start, t_len;      /* host ticks, set on promotion */
++    double   t_plan, t_plan_len;  /* the plan's frame start and length */
+ } PassGen;
++/* The latest plan's frame start and length (gl_renderer_pass_plan), for the
++ * generation it opens. */
++static double   s_pass_plan_start, s_pass_plan_len;
+ static int      s_pass_flip_shown = 0;
+ static PassGen  s_pgen[2];
+ /* Double-buffer complete pairs: the unpublished set may be overwritten while
+@@ -8125,6 +8131,14 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
+     }
+     freq = (double)SDL_GetPerformanceFrequency();
+     sp = freq / s_interp_source_hz;
++    {
++        /* The schedule's own VBlank length: locked to the display refresh it
++         * is whole refreshes (60 Hz, not the guest's 59.94), and a frame
++         * placed with the guest's rate drifts against the output deadlines
++         * until they read as phase 0.998 instead of 0.5. */
++        const double live_sp = s_interp_schedule.frame_end - s_interp_schedule.frame_start;
++        if (live_sp > sp * 0.9 && live_sp < sp * 1.1) sp = live_sp;
++    }
+     cap = pass_slot_cap(s_interp_w, s_interp_h);
+     if (cap < 2) return 0;
+     memset(&in, 0, sizeof in);
+@@ -8146,6 +8160,8 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
+                                        (double)s_pass_budget_pct / 100.0);
+     }
+     in.max = max < cap - 1u ? max : cap - 1u;
++    s_pass_plan_start = in.frame_start;
++    s_pass_plan_len = in.frame_length;
+     {
+         uint32_t want = 0, n = render_pass_plan_phases(&in, alpha_q16, &want);
+         if (wanted) *wanted = want;
+@@ -8529,6 +8545,8 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+         g->source_path = wide ? GL_PRES_WIDE : GL_PRES_VRAM;
+         g->period = period_vblanks ? period_vblanks : 1u;
+         g->shown = s_pass_flip_shown;
++        g->t_plan = s_pass_plan_start;
++        g->t_plan_len = s_pass_plan_len;
+         pass_capture_into(s_pgen_tex[gi][0], g);   /* the game's own image */
+         g->phase[0] = 0;
+         g->n = 1;
+@@ -9116,11 +9134,40 @@ static int pass_gen_present(uint64_t deadline) {
+     return 1;
+ }
+ 
++/* A title's hook run before each scheduled present of a source interval
++ * (psx_mod_set_render_pass_present_hook): late passes whose input arrives
++ * between two presents of one interval join before the second. While it
++ * runs, presents are not serviced from inside its passes (the loop below
++ * owns the schedule) and the slack is to the present about to be made. */
++static void (*s_pre_present_hook)(void);
++static int s_in_pre_present;
++static double s_pre_present_deadline;
++void gl_renderer_pass_set_present_hook(void (*fn)(void)) {
++    GL_RT_SYNC("pass_set_present_hook");
++    s_pre_present_hook = fn;
++}
++static void pass_run_present_hook(uint64_t deadline) {
++    if (!s_pre_present_hook || s_in_pre_present || s_pass_active) return;
++    s_in_pre_present = 1;
++    s_pre_present_deadline = (double)deadline;
++    s_pre_present_hook();
++    s_in_pre_present = 0;
++}
++
++double gl_renderer_pass_present_slack_ms(void) {
++    GL_RT_SYNC("pass_present_slack");
++    const double d = s_in_pre_present ? s_pre_present_deadline
++                                      : s_interp_schedule.next_present_deadline;
++    const double now = (double)SDL_GetPerformanceCounter();
++    if (!gl_renderer_pass_ready() || !(d > 0.0)) return 0.0;
++    return d > now ? (d - now) * 1000.0 / (double)SDL_GetPerformanceFrequency() : 0.0;
++}
++
+ void gl_renderer_pass_service_presents(void) {
+     GL_RT_SYNC("pass_service_presents");
+     uint64_t deadline;
+     double sp;
+-    if (!gl_renderer_pass_ready() || s_pass_active) return;
++    if (!gl_renderer_pass_ready() || s_pass_active || s_in_pre_present) return;
+     sp = (double)SDL_GetPerformanceFrequency() / s_interp_source_hz;
+     while (frame_interpolation_schedule_due(
+                &s_interp_schedule, SDL_GetPerformanceCounter(),
+@@ -9249,6 +9296,17 @@ static void pass_apply_promotion(void) {
+         g->promoted = 1;
+         g->t_start = s_interp_schedule.frame_start;
+         g->t_len = (double)g->period * sp;
++        /* Present by the times the passes were planned for. The flip is seen
++         * at the capture of the VBlank it happens in, one VBlank before the
++         * plan's frame start (shown_after_vblanks): timed from the promoting
++         * interval, the first present already read phase 0.5 and showed the
++         * in-between image, the next one held it, and the game's own frame
++         * never reached the screen (image pairs A' A' B' B'). */
++        if (g->t_plan > 0.0 && g->t_plan_len > 0.0 &&
++            fabs(g->t_plan - g->t_start) < g->t_plan_len) {
++            g->t_start = g->t_plan;
++            g->t_len = g->t_plan_len;
++        }
+         /* Phase 0 is the image the game actually flipped to. The capture at
+          * the pass point is the same for a game that draws nothing more into
+          * the rect before its flip; a game that finishes the frame later (V8:2
+diff --git a/runtime/src/mod_packages.cpp b/runtime/src/mod_packages.cpp
+index 35979a73..3b48c03d 100644
+--- a/runtime/src/mod_packages.cpp
++++ b/runtime/src/mod_packages.cpp
+@@ -18,6 +18,11 @@
+ #include <sstream>
+ #include <system_error>
+ #include <tuple>
++#ifdef _WIN32
++#include <process.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -2876,7 +2881,14 @@ bool ModPackageManager::save_state(std::string* error) const {
+         set_error(error, "cannot create mods directory: " + ec.message());
+         return false;
+     }
+-    const fs::path temp = root_ / "state.toml.tmp";
++    /* Per process: render-pass helpers (pass_worker.c) start together and
++     * each commits the same selection; a shared temp name made all but one
++     * fail to launch. */
++#ifdef _WIN32
++    const fs::path temp = root_ / ("state.toml." + std::to_string(_getpid()) + ".tmp");
++#else
++    const fs::path temp = root_ / ("state.toml." + std::to_string(getpid()) + ".tmp");
++#endif
+     const fs::path final = root_ / "state.toml";
+     std::ofstream out(temp, std::ios::trunc);
+     if (!out) {
+diff --git a/runtime/src/pass_worker.c b/runtime/src/pass_worker.c
+index 13690889..67f0e539 100644
+--- a/runtime/src/pass_worker.c
++++ b/runtime/src/pass_worker.c
+@@ -57,6 +57,7 @@ typedef struct PwShm {
+     volatile long job_seq, done_seq;
+     volatile long ready;          /* the helper is serving jobs */
+     int32_t  ok;
++    int32_t  why;                 /* failed job: 1 job, 2 pages, 3 PGXP */
+     uint32_t gpr[32], hi, lo, gte_data[32], gte_ctrl[32];
+     uint32_t user_len;
+     uint8_t  user[PW_USER_BYTES];
+@@ -85,15 +86,25 @@ int psx_mod_pass_worker_set_job(PSXModPassWorkerJob job) {
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ 
+-static PwShm  *s_shm;
+-static HANDLE  s_map, s_ev_job, s_ev_done, s_child;
+-static int     s_helper;            /* this process is the helper */
+-static int     s_failed;            /* main: helper unusable for the session */
+-static int     s_pending;           /* main: a job is out */
+-static int     s_have_result;       /* main: the last job's result is kept */
+-static long    s_seq;
+-static char    s_launch_game[1024], s_launch_disc[1024];
+-static char    s_name[96];
++/* One helper process per slot (psx_mod_pass_worker_start(count), up to
++ * PW_MAX_WORKERS): each has its own shared block, events and job sequence, so
++ * several in-between frames of one game frame are built at once on different
++ * cores. A helper process uses slot 0 only. */
++#define PW_MAX_WORKERS 4u
++typedef struct PwSlot {
++    PwShm  *shm;
++    HANDLE  map, ev_job, ev_done, child;
++    int     pending;              /* main: a job is out */
++    int     have_result;          /* main: the last job's result is kept */
++    long    seq;
++} PwSlot;
++static PwSlot   s_w[PW_MAX_WORKERS];
++static uint32_t s_nworkers;
++static PwShm   *s_shm;              /* helper: its block */
++static HANDLE   s_ev_job, s_ev_done;/* helper: its events */
++static int      s_helper;           /* this process is the helper */
++static int      s_failed;           /* main: helpers unusable for the session */
++static char     s_launch_game[1024], s_launch_disc[1024];
+ static PSXModPassWorkerStats s_stats;
+ 
+ /* main.cpp: the resolved game config and disc of this session, for the
+@@ -103,20 +114,20 @@ void pass_worker_note_launch(const char *game, const char *disc) {
+     snprintf(s_launch_disc, sizeof s_launch_disc, "%s", disc ? disc : "");
+ }
+ 
+-static int open_objects(const char *name, int create) {
++static int open_objects(PwSlot *w, const char *name, int create) {
+     char n[160];
+     snprintf(n, sizeof n, "Local\\%s_shm", name);
+-    s_map = create ? CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+-                                        (DWORD)sizeof(PwShm), n)
+-                   : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, n);
+-    if (!s_map) return 0;
+-    s_shm = (PwShm *)MapViewOfFile(s_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(PwShm));
+-    if (!s_shm) return 0;
++    w->map = create ? CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
++                                         (DWORD)sizeof(PwShm), n)
++                    : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, n);
++    if (!w->map) return 0;
++    w->shm = (PwShm *)MapViewOfFile(w->map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(PwShm));
++    if (!w->shm) return 0;
+     snprintf(n, sizeof n, "Local\\%s_job", name);
+-    s_ev_job = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
++    w->ev_job = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
+     snprintf(n, sizeof n, "Local\\%s_done", name);
+-    s_ev_done = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
+-    return s_ev_job && s_ev_done;
++    w->ev_done = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
++    return w->ev_job && w->ev_done;
+ }
+ 
+ int psx_mod_pass_worker_is_helper(void) { return s_helper; }
+@@ -132,45 +143,29 @@ static void env_restore(const char *name, const char *old) {
+     SetEnvironmentVariableA(name, old[0] ? old : NULL);
+ }
+ 
+-int psx_mod_pass_worker_start(void) {
+-    if (s_helper || s_failed) return 0;
+-    if (s_child) return 1;
+-    if (!s_job || psx_ram_live_bytes() != PW_RAM_BYTES || pgxp_value_size() > PW_PGXP_VALUE ||
+-        !s_launch_game[0]) {
+-        s_failed = 1;
+-        return 0;
+-    }
+-    char exe[MAX_PATH];
+-    DWORD el = GetModuleFileNameA(NULL, exe, sizeof exe);
+-    if (el == 0 || el >= sizeof exe) { s_failed = 1; return 0; }
+-    snprintf(s_name, sizeof s_name, "psxrecomp_pw_%lu", (unsigned long)GetCurrentProcessId());
+-    if (!open_objects(s_name, 1)) { s_failed = 1; return 0; }
+-    char tmp[MAX_PATH];
+-    DWORD tl = GetTempPathA(sizeof tmp, tmp);
+-    if (tl == 0 || tl >= sizeof tmp) { s_failed = 1; return 0; }
+-    /* One folder for every helper: its memory cards (never written) and its
+-     * console output, overwritten per session. */
+-    char state_dir[MAX_PATH + 96];
+-    snprintf(state_dir, sizeof state_dir, "%spsxrecomp_pass_worker", tmp);
+-    CreateDirectoryA(state_dir, NULL);
++static int start_one(PwSlot *w, uint32_t index, const char *exe, const char *state_dir) {
++    char name[96];
++    snprintf(name, sizeof name, "psxrecomp_pw_%lu_%u",
++             (unsigned long)GetCurrentProcessId(), (unsigned)index);
++    if (!open_objects(w, name, 1)) return 0;
+     char cmd[4096];
+     snprintf(cmd, sizeof cmd,
+              "\"%s\" --no-launcher --headless --pass-worker %s %lu --memcard-dir \"%s\" "
+              "--game \"%s\"%s%s%s",
+-             exe, s_name, (unsigned long)GetCurrentProcessId(), state_dir,
++             exe, name, (unsigned long)GetCurrentProcessId(), state_dir,
+              s_launch_game, s_launch_disc[0] ? " --disc \"" : "", s_launch_disc,
+              s_launch_disc[0] ? "\"" : "");
+     /* The helper never plays: no audio device, no capture or compile work,
+      * no save-state load, nothing written next to the game. */
+     char captures[MAX_PATH + 160];
+-    snprintf(captures, sizeof captures, "%s\\captures.json", state_dir);
++    snprintf(captures, sizeof captures, "%s\\captures_%u.json", state_dir, (unsigned)index);
+     static char o_audio[256], o_auto[64], o_caps[1024], o_slot[64];
+     env_swap("SDL_AUDIODRIVER", "dummy", o_audio, sizeof o_audio);
+     env_swap("PSX_OVERLAY_AUTOCOMPILE_OFF", "1", o_auto, sizeof o_auto);
+     env_swap("PSX_OVERLAY_CAPTURES", captures, o_caps, sizeof o_caps);
+     env_swap("PSX_LOAD_SLOT", NULL, o_slot, sizeof o_slot);
+     char log_path[MAX_PATH + 160];
+-    snprintf(log_path, sizeof log_path, "%s\\helper_log.txt", state_dir);
++    snprintf(log_path, sizeof log_path, "%s\\helper_log_%u.txt", state_dir, (unsigned)index);
+     SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
+     HANDLE log = CreateFileA(log_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+@@ -189,98 +184,168 @@ int psx_mod_pass_worker_start(void) {
+     env_restore("PSX_OVERLAY_AUTOCOMPILE_OFF", o_auto);
+     env_restore("PSX_OVERLAY_CAPTURES", o_caps);
+     env_restore("PSX_LOAD_SLOT", o_slot);
+-    if (!ok) { s_failed = 1; return 0; }
++    if (!ok) return 0;
+     CloseHandle(pi.hThread);
+-    s_child = pi.hProcess;
+-    s_seq = 0;
+-    s_pending = 0;
+-    s_have_result = 0;
++    w->child = pi.hProcess;
++    w->seq = 0;
++    w->pending = 0;
++    w->have_result = 0;
+     return 1;
+ }
+ 
+-static int child_alive(void) {
+-    if (!s_child) return 0;
+-    if (WaitForSingleObject(s_child, 0) == WAIT_TIMEOUT) return 1;
+-    if (!s_failed) {
+-        DWORD code = 0;
+-        GetExitCodeProcess(s_child, &code);
+-        fprintf(stderr, "psxrecomp: render pass worker exited (code 0x%lX); "
+-                "passes run in-process\n", (unsigned long)code);
++uint32_t psx_mod_pass_worker_start(uint32_t count) {
++    if (s_helper || s_failed) return 0;
++    if (s_nworkers) return s_nworkers;
++    if (count < 1) count = 1;
++    if (count > PW_MAX_WORKERS) count = PW_MAX_WORKERS;
++    if (!s_job || psx_ram_live_bytes() != PW_RAM_BYTES || pgxp_value_size() > PW_PGXP_VALUE ||
++        !s_launch_game[0]) {
+         s_failed = 1;
++        return 0;
++    }
++    char exe[MAX_PATH];
++    DWORD el = GetModuleFileNameA(NULL, exe, sizeof exe);
++    if (el == 0 || el >= sizeof exe) { s_failed = 1; return 0; }
++    char tmp[MAX_PATH];
++    DWORD tl = GetTempPathA(sizeof tmp, tmp);
++    if (tl == 0 || tl >= sizeof tmp) { s_failed = 1; return 0; }
++    /* One folder for every helper: its memory cards (never written) and its
++     * console output, overwritten per session. */
++    char state_dir[MAX_PATH + 96];
++    snprintf(state_dir, sizeof state_dir, "%spsxrecomp_pass_worker", tmp);
++    CreateDirectoryA(state_dir, NULL);
++    for (uint32_t i = 0; i < count; i++) {
++        if (!start_one(&s_w[i], i, exe, state_dir)) break;
++        s_nworkers = i + 1;
++    }
++    if (!s_nworkers) { s_failed = 1; return 0; }
++    s_stats.workers = s_nworkers;
++    return s_nworkers;
++}
++
++/* A helper that exited is out for the session; when it was the last one,
++ * so is the worker and titles go back to in-process passes. */
++static int child_alive(PwSlot *w) {
++    if (!w->child) return 0;
++    if (WaitForSingleObject(w->child, 0) == WAIT_TIMEOUT) return 1;
++    DWORD code = 0;
++    GetExitCodeProcess(w->child, &code);
++    fprintf(stdout, "psxrecomp: render pass worker %u exited (code 0x%lX)\n",
++            (unsigned)(w - s_w), (unsigned long)code);
++    CloseHandle(w->child);
++    w->child = NULL;
++    w->pending = 0;
++    w->have_result = 0;
++    {
++        uint32_t alive = 0;
++        for (uint32_t i = 0; i < s_nworkers; i++) alive += s_w[i].child != NULL;
++        if (!alive) s_failed = 1;
+     }
+     return 0;
+ }
+ 
+-int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user,
+-                               uint32_t len) {
+-    if (!s_child || s_failed || s_pending || !st || !st->ram || !st->scratchpad ||
++static PwSlot *slot_of(uint32_t slot) {
++    return slot < s_nworkers ? &s_w[slot] : NULL;
++}
++
++uint32_t psx_mod_pass_worker_count(void) { return s_failed ? 0 : s_nworkers; }
++
++int psx_mod_pass_worker_submit(uint32_t slot, const PSXModPassWorkerState *st,
++                               const void *user, uint32_t len) {
++    PwSlot *w = slot_of(slot);
++    if (!w || !w->child || s_failed || w->pending || !st || !st->ram || !st->scratchpad ||
+         !st->gpr || !st->gte_data || !st->gte_ctrl || len > PW_USER_BYTES)
+         return 0;
+-    if (!child_alive()) { s_failed = 1; return 0; }
+-    if (!s_shm->ready) return 0;   /* still starting */
+-    s_have_result = 0;
+-    memcpy(s_shm->ram, st->ram, PW_RAM_BYTES);
+-    memcpy(s_shm->spad, st->scratchpad, PW_SPAD_BYTES);
+-    s_shm->dirty_n = dirty_ram_get_bitmap_word_count();
+-    if (s_shm->dirty_n > PW_DIRTY_WORDS) s_shm->dirty_n = PW_DIRTY_WORDS;
+-    for (uint32_t i = 0; i < s_shm->dirty_n; i++) s_shm->dirty[i] = dirty_ram_get_bitmap_word(i);
+-    memcpy(s_shm->gpr, st->gpr, sizeof s_shm->gpr);
+-    s_shm->hi = st->hi;
+-    s_shm->lo = st->lo;
+-    memcpy(s_shm->gte_data, st->gte_data, sizeof s_shm->gte_data);
+-    memcpy(s_shm->gte_ctrl, st->gte_ctrl, sizeof s_shm->gte_ctrl);
+-    s_shm->user_len = len;
+-    if (len) memcpy(s_shm->user, user, len);
+-    s_shm->ok = 0;
++    if (!child_alive(w)) return 0;
++    PwShm *shm = w->shm;
++    if (!shm->ready) return 0;   /* still starting */
++    w->have_result = 0;
++    memcpy(shm->ram, st->ram, PW_RAM_BYTES);
++    memcpy(shm->spad, st->scratchpad, PW_SPAD_BYTES);
++    shm->dirty_n = dirty_ram_get_bitmap_word_count();
++    if (shm->dirty_n > PW_DIRTY_WORDS) shm->dirty_n = PW_DIRTY_WORDS;
++    for (uint32_t i = 0; i < shm->dirty_n; i++) shm->dirty[i] = dirty_ram_get_bitmap_word(i);
++    memcpy(shm->gpr, st->gpr, sizeof shm->gpr);
++    shm->hi = st->hi;
++    shm->lo = st->lo;
++    memcpy(shm->gte_data, st->gte_data, sizeof shm->gte_data);
++    memcpy(shm->gte_ctrl, st->gte_ctrl, sizeof shm->gte_ctrl);
++    shm->user_len = len;
++    if (len) memcpy(shm->user, user, len);
++    shm->ok = 0;
+     MemoryBarrier();
+-    s_shm->job_seq = ++s_seq;
+-    SetEvent(s_ev_job);
+-    s_pending = 1;
++    shm->job_seq = ++w->seq;
++    SetEvent(w->ev_job);
++    w->pending = 1;
+     s_stats.submitted++;
+     return 1;
+ }
+ 
+-int psx_mod_pass_worker_pending(void) { return s_pending; }
++int psx_mod_pass_worker_pending(uint32_t slot) {
++    PwSlot *w = slot_of(slot);
++    return w ? w->pending : 0;
++}
+ 
+-int psx_mod_pass_worker_ready(void) {
+-    return s_child && !s_failed && s_shm && s_shm->ready && child_alive();
++int psx_mod_pass_worker_ready(uint32_t slot) {
++    PwSlot *w = slot_of(slot);
++    return w && w->child && !s_failed && w->shm && w->shm->ready && child_alive(w);
+ }
+ 
+-int psx_mod_pass_worker_result(uint32_t wait_ms) {
+-    if (!s_pending) return s_have_result;
+-    if (s_shm->done_seq != s_seq) {
+-        const DWORD r = WaitForSingleObject(s_ev_done, wait_ms);
+-        if (r != WAIT_OBJECT_0 && s_shm->done_seq != s_seq) {
+-            if (!child_alive()) { s_failed = 1; s_pending = 0; }
+-            s_stats.late++;
+-            return 0;
++int psx_mod_pass_worker_result(uint32_t slot, uint32_t wait_ms) {
++    PwSlot *w = slot_of(slot);
++    if (!w) return 0;
++    if (!w->pending) return w->have_result;
++    PwShm *shm = w->shm;
++    /* The done event is auto-reset and can still be set by an earlier job
++     * that finished after its wait gave up: only the sequence says this
++     * job is done. */
++    if (shm->done_seq != w->seq) {
++        const ULONGLONG until = GetTickCount64() + wait_ms;
++        for (;;) {
++            const ULONGLONG now = GetTickCount64();
++            const DWORD left = now < until ? (DWORD)(until - now) : 0;
++            const DWORD r = WaitForSingleObject(w->ev_done, left);
++            if (shm->done_seq == w->seq) break;
++            if (r != WAIT_OBJECT_0 || left == 0) {
++                (void)child_alive(w);
++                s_stats.late++;
++                return 0;
++            }
+         }
+     }
+     MemoryBarrier();
+-    s_pending = 0;
+-    if (!s_shm->ok) { s_stats.failed++; return 0; }
++    w->pending = 0;
++    if (!shm->ok) {
++        s_stats.failed++;
++        if (shm->why >= 1 && shm->why <= 3) s_stats.failed_why[shm->why - 1]++;
++        return 0;
++    }
+     s_stats.done++;
+-    s_stats.last_job_ms = s_shm->job_ms;
+-    s_stats.last_pages = s_shm->npages;
+-    s_stats.last_pgxp = s_shm->npgxp;
+-    s_have_result = 1;
++    s_stats.last_job_ms = shm->job_ms;
++    s_stats.last_pages = shm->npages;
++    s_stats.last_pgxp = shm->npgxp;
++    w->have_result = 1;
+     return 1;
+ }
+ 
+-int psx_mod_pass_worker_apply(void) {
+-    if (!g_psx_render_pass_active || s_helper || !s_shm || !s_have_result) return 0;
++int psx_mod_pass_worker_apply(uint32_t slot) {
++    PwSlot *w = slot_of(slot);
++    if (!g_psx_render_pass_active || s_helper || !w || !w->shm || !w->have_result) return 0;
++    const PwShm *shm = w->shm;
+     uint8_t *ram = memory_get_ram_ptr();
+-    for (uint32_t i = 0; i < s_shm->npages; i++)
+-        memcpy(ram + (size_t)s_shm->page_idx[i] * PW_PAGE, s_shm->pages[i], PW_PAGE);
+-    memcpy(memory_get_scratchpad_ptr(), s_shm->spad_out, PW_SPAD_BYTES);
+-    pgxp_pass_import(s_shm->pgxp_idx, s_shm->pgxp_val, s_shm->npgxp);
++    for (uint32_t i = 0; i < shm->npages; i++)
++        memcpy(ram + (size_t)shm->page_idx[i] * PW_PAGE, shm->pages[i], PW_PAGE);
++    memcpy(memory_get_scratchpad_ptr(), shm->spad_out, PW_SPAD_BYTES);
++    pgxp_pass_import(shm->pgxp_idx, shm->pgxp_val, shm->npgxp);
+     return 1;
+ }
+ 
+ void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats *out) {
+     if (!out) return;
+     *out = s_stats;
+-    out->running = child_alive();
++    out->running = 0;
++    for (uint32_t i = 0; i < s_nworkers; i++)
++        if (child_alive(&s_w[i])) out->running++;
+     out->failed_session = s_failed;
+ }
+ 
+@@ -307,10 +372,12 @@ static void helper_job(struct CPUState *cpu) {
+     int ok = 0;
+     s_shm->npages = 0;
+     s_shm->npgxp = 0;
++    s_shm->why = 0;
+     if (psx_cycle_freeze_begin(&freeze, PW_WATCHDOG, helper_overrun)) {
+         gte_precision_checkpoint_begin();
+         if (setjmp(s_jmp) == 0) {
+             ok = s_job ? s_job(cpu, s_shm->user, s_shm->user_len) : 0;
++            if (!ok) s_shm->why = 1;
+         } else {
+             /* Runaway job: the host nesting it left is unknown. Report and
+              * exit; the main process falls back to in-process passes. */
+@@ -328,7 +395,7 @@ static void helper_job(struct CPUState *cpu) {
+         for (uint32_t p = 0; ok && p < PW_PAGES; p++) {
+             if (memcmp(ram + (size_t)p * PW_PAGE, s_shm->ram + (size_t)p * PW_PAGE, PW_PAGE) == 0)
+                 continue;
+-            if (np == PW_MAX_PAGES) { ok = 0; break; }
++            if (np == PW_MAX_PAGES) { ok = 0; s_shm->why = 2; break; }
+             s_shm->page_idx[np] = (uint16_t)p;
+             memcpy(s_shm->pages[np], ram + (size_t)p * PW_PAGE, PW_PAGE);
+             np++;
+@@ -337,7 +404,7 @@ static void helper_job(struct CPUState *cpu) {
+         memcpy(s_shm->spad_out, memory_get_scratchpad_ptr(), PW_SPAD_BYTES);
+         if (ok) {
+             const uint32_t n = pgxp_pass_export(s_shm->pgxp_idx, s_shm->pgxp_val, PW_MAX_PGXP);
+-            if (n == UINT32_MAX) ok = 0;
++            if (n == UINT32_MAX) { ok = 0; s_shm->why = 3; }
+             else s_shm->npgxp = n;
+         }
+         gte_precision_checkpoint_rollback();
+@@ -353,7 +420,11 @@ static void helper_job(struct CPUState *cpu) {
+ int pass_worker_helper_main(struct CPUState *cpu, const char *name, unsigned long parent_pid) {
+     s_helper = 1;
+     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)parent_pid);
+-    if (!parent || !open_objects(name, 0) || pgxp_value_size() > PW_PGXP_VALUE) return 2;
++    if (!parent || !open_objects(&s_w[0], name, 0) || pgxp_value_size() > PW_PGXP_VALUE)
++        return 2;
++    s_shm = s_w[0].shm;
++    s_ev_job = s_w[0].ev_job;
++    s_ev_done = s_w[0].ev_done;
+     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+     MemoryBarrier();
+     s_shm->ready = 1;
+@@ -383,15 +454,18 @@ void pass_worker_note_launch(const char *game, const char *disc) {
+     (void)game; (void)disc;
+ }
+ int psx_mod_pass_worker_is_helper(void) { return 0; }
+-int psx_mod_pass_worker_start(void) { return 0; }
+-int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user,
+-                               uint32_t len) {
+-    (void)st; (void)user; (void)len; return 0;
++uint32_t psx_mod_pass_worker_start(uint32_t count) { (void)count; return 0; }
++uint32_t psx_mod_pass_worker_count(void) { return 0; }
++int psx_mod_pass_worker_submit(uint32_t slot, const PSXModPassWorkerState *st,
++                               const void *user, uint32_t len) {
++    (void)slot; (void)st; (void)user; (void)len; return 0;
++}
++int psx_mod_pass_worker_pending(uint32_t slot) { (void)slot; return 0; }
++int psx_mod_pass_worker_ready(uint32_t slot) { (void)slot; return 0; }
++int psx_mod_pass_worker_result(uint32_t slot, uint32_t wait_ms) {
++    (void)slot; (void)wait_ms; return 0;
+ }
+-int psx_mod_pass_worker_pending(void) { return 0; }
+-int psx_mod_pass_worker_ready(void) { return 0; }
+-int psx_mod_pass_worker_result(uint32_t wait_ms) { (void)wait_ms; return 0; }
+-int psx_mod_pass_worker_apply(void) { return 0; }
++int psx_mod_pass_worker_apply(uint32_t slot) { (void)slot; return 0; }
+ void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats *out) {
+     if (out) memset(out, 0, sizeof *out);
+ }
+diff --git a/runtime/src/render_pass.c b/runtime/src/render_pass.c
+index 87e9a943..6d01b381 100644
+--- a/runtime/src/render_pass.c
++++ b/runtime/src/render_pass.c
+@@ -868,6 +868,14 @@ int psx_mod_render_pass_open(const PSXModRenderPass *rect) {
+     return ok;
+ }
+ 
++void psx_mod_set_render_pass_present_hook(PSXModVBlankCallback fn) {
++    gl_renderer_pass_set_present_hook(fn);
++}
++
++double psx_mod_render_pass_present_slack_ms(void) {
++    return passes_allowed() ? gl_renderer_pass_present_slack_ms() : 0.0;
++}
++
+ int psx_mod_render_pass_late(struct CPUState *cpu, const PSXModRenderPass *pass,
+                              PSXModRenderPassFn fn, void *user) {
+     return render_transaction(cpu, pass, fn, user, RP_EYE_LATE);
+diff --git a/runtime/src/render_pass_plan.c b/runtime/src/render_pass_plan.c
+index ca7711c1..f85e0ef3 100644
+--- a/runtime/src/render_pass_plan.c
++++ b/runtime/src/render_pass_plan.c
+@@ -40,7 +40,9 @@ uint32_t render_pass_plan_phases(const RenderPassPlanInput *in,
+         for (; d < end && count < cap; d += in->target_period) {
+             double p = (d - in->frame_start) / in->frame_length;
+             if (p < 1.0 / 64.0) continue;
+-            if (p >= 1.0) break;
++            /* A deadline at the frame's end shows the next game frame: an
++             * image there would be that frame, early. */
++            if (p >= 1.0 - 1.0 / 64.0) break;
+             phases[count++] = p;
+         }
+     }
+diff --git a/runtime/tests/test_render_pass_plan.c b/runtime/tests/test_render_pass_plan.c
+index 35ba0b35..56874c5a 100644
+--- a/runtime/tests/test_render_pass_plan.c
++++ b/runtime/tests/test_render_pass_plan.c
+@@ -56,6 +56,28 @@ static void test_counts_per_rate(void) {
+     }
+ }
+ 
++/* Output deadlines just before the frame's VBlank boundaries (the presenter
++ * locked to the display refresh): the one at the frame's end shows the next
++ * game frame, so 60 presents/s plan the middle only, never phase 0.998. */
++static void test_frame_end_deadline(void) {
++    RenderPassPlanInput in = {0};
++    uint32_t a[RENDER_PASS_MAX_PHASES], wanted = 0, n;
++    in.frame_start = 1e12;
++    in.frame_length = 2.0 * 1e9 / 60.0;
++    in.target_period = 1e9 / 60.0;
++    in.next_deadline = in.frame_start - 50000.0;   /* 50 us early */
++    in.budget = -1.0;
++    in.max = RENDER_PASS_MAX_PHASES;
++    n = render_pass_plan_phases(&in, a, &wanted);
++    CHECK(n == 1 && wanted == 1, "60 on a 30 Hz frame: one in-between");
++    CHECK(n == 1 && fabs(a[0] / 65536.0 - 0.5) < 0.01, "it is the middle");
++    in.max = 1;
++    in.budget = 1e9;
++    in.pass_cost = 1e6;
++    n = render_pass_plan_phases(&in, a, NULL);
++    CHECK(n == 1 && fabs(a[0] / 65536.0 - 0.5) < 0.01, "a one-pass budget keeps the middle");
++}
++
+ static void test_shedding(void) {
+     RenderPassPlanInput in = {0};
+     uint32_t a[RENDER_PASS_MAX_PHASES], wanted = 0, n;
+@@ -417,6 +439,7 @@ int main(void) {
+     test_stereo_pair_fresh();
+     test_store_policy();
+     test_counts_per_rate();
++    test_frame_end_deadline();
+     test_shedding();
+     test_select();
+     test_gen_select_late();
+-- 
+2.55.0.windows.5
+

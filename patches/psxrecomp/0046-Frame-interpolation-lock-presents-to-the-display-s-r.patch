@@ -1,0 +1,577 @@
+From 70c003dc9c26fbf8cd5f5a67569bfd4390008559 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 19:06:11 +0200
+Subject: [PATCH] Frame interpolation: lock presents to the display's refresh
+ grid
+
+Presented on a host timer alone, the 60/s render-pass schedule beat against
+a 120 Hz display: images stayed one or three refreshes instead of two, a
+judder while the frame counter read 60. When the compositor reports its
+vblank grid (Windows DWM) and the guest and output rates are within 2% of
+whole refreshes, every deadline now sits half a refresh before a vblank,
+re-snapped each interval so host-timer drift cannot walk it into the
+boundary, and the swap waits for vblank. Off whole refreshes nothing changes.
+
+Measured, Vagrant Story render passes at 60 on a 120 Hz panel, 2 x 3 runs:
+images held two refreshes 39% -> 86%. PSX_INTERP_REFRESH_LOCK=0 turns it
+off, 2 keeps vsync off. PSX_PRESENT_PACING=1 (TCP present_pacing) measures
+refreshes per image and present lateness.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ docs/FRAME_RATE.md                            |  12 +-
+ runtime/include/frame_interpolation.h         |  13 ++
+ runtime/include/frame_pacing.h                |  15 ++
+ runtime/src/debug_server.c                    |  11 +
+ runtime/src/frame_interpolation.c             |  56 +++++-
+ runtime/src/frame_pacing.c                    | 188 ++++++++++++++++++
+ runtime/src/gpu_gl_renderer.c                 |  50 ++++-
+ .../tests/test_frame_interpolation_schedule.c |  41 ++++
+ 8 files changed, 381 insertions(+), 5 deletions(-)
+
+diff --git a/docs/FRAME_RATE.md b/docs/FRAME_RATE.md
+index cc9d9482..def7348d 100644
+--- a/docs/FRAME_RATE.md
++++ b/docs/FRAME_RATE.md
+@@ -60,7 +60,17 @@ FLIP mode shows about 30 captures and 30 duplicates per second.
+ - OpenGL only; a command-line `--renderer` override after activation drops
+   it. Netplay sessions run without mods, so without interpolation.
+ - FMV (MDEC / 24-bit) frames suspend it, as does rewind.
+-- Vsync is off: on a fixed-refresh panel pick the display refresh rate.
++- Vsync is off, except where the presenter can lock to the display's
++  refresh: when the compositor reports its vblank grid (Windows DWM) and the
++  guest and output rates are within 2% of whole refreshes (60 presents/s on
++  60/120/240 Hz), every present sits half a refresh before a vblank and the
++  swap waits for vblank. Measured on a 120 Hz panel (Vagrant Story, render
++  passes at 60): images held the intended two refreshes 39% -> 86% of the
++  time. `PSX_INTERP_REFRESH_LOCK=0` turns the lock off, `2` keeps vsync off.
++  Off whole refreshes (60 on 144 Hz) the host timer cadence is unchanged.
++- `PSX_PRESENT_PACING=1` records every swap and logs, every 5 s, refreshes
++  per presented image and how late scheduled presents start (TCP
++  `present_pacing` in debug builds).
+ 
+ Tests: `frame_interpolation_schedule_test` (runtime ctest) covers the phase
+ windows, the flip tracker, the new-frame decision and output counts per rate
+diff --git a/runtime/include/frame_interpolation.h b/runtime/include/frame_interpolation.h
+index 4e80efc5..383e1bda 100644
+--- a/runtime/include/frame_interpolation.h
++++ b/runtime/include/frame_interpolation.h
+@@ -17,8 +17,21 @@ typedef struct FrameInterpolationSchedule {
+      * plans the whole 0..1 window, which is the historical behaviour. */
+     double phase_lo;
+     double phase_hi;
++    /* Display refresh grid (set_grid): host ticks of a point a fixed lead
++     * before a display vblank, and the refresh period. 0 = no grid. */
++    double grid_origin;
++    double grid_period;
+ } FrameInterpolationSchedule;
+ 
++/* Lock the schedule to the display's refresh grid. With a grid, a source or
++ * output period within 2% of a whole number of refreshes becomes exactly that
++ * many refreshes, and every deadline sits on the grid, so each image stays on
++ * screen for the same number of refreshes instead of 1-or-3 as the host timer
++ * and the display drift past each other. Call before each begin(); the origin
++ * follows the display's own clock. period <= 0 turns the grid off. */
++void frame_interpolation_schedule_set_grid(FrameInterpolationSchedule *schedule,
++                                           double origin, double period);
++
+ /* Plan one stock guest-frame interval. Presentation deadlines remain anchored
+  * across calls so guest work consumes part of the interval instead of slowing
+  * the simulation. Returns zero when the rates or host clock are invalid. */
+diff --git a/runtime/include/frame_pacing.h b/runtime/include/frame_pacing.h
+index 44eb4313..475a2aab 100644
+--- a/runtime/include/frame_pacing.h
++++ b/runtime/include/frame_pacing.h
+@@ -55,6 +55,21 @@ void frame_pacer_wait(FramePacer *p, double period_ms);
+  * a game that presents every other vblank runs at 2x. */
+ int psx_present_vsync_owns_cadence(void);
+ 
++/* Present pacing diagnostic (PSX_PRESENT_PACING=1, TCP "present_pacing").
++ * Records the host time after every window swap and, on Windows, the
++ * compositor's vblank grid (DwmGetCompositionTimingInfo), so a session can
++ * see how many display refreshes each presented image stayed on screen.
++ * Off by default: present_pacing_note_swap() is one branch then. */
++void present_pacing_note_swap(void);
++
++/* The display's refresh grid: the host perf-counter time of its last vblank
++ * and the refresh period in perf-counter ticks (Windows: the compositor's
++ * DwmGetCompositionTimingInfo). 0 where the platform does not report it. */
++int psx_host_vblank_grid(uint64_t *last_vblank, uint64_t *period);
++int present_pacing_json(char *out, int cap, int reset);
++/* A scheduled present is about to be drawn: how late it starts. */
++void present_pacing_note_deadline(uint64_t deadline);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index a656a32a..94177611 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -58,6 +58,7 @@
+ #include "psx_memory.h"
+ #include "card_read_summary.h"
+ #include "card_data_writes.h"
++#include "frame_pacing.h"
+ #include "crash_trace.h"
+ #include "gpu_gl_renderer.h"
+ #include "render_pass.h"
+@@ -5330,6 +5331,15 @@ static void handle_write_ram(int id, const char *json)
+     send_ok(id);
+ }
+ 
++/* present_pacing — PSX_PRESENT_PACING=1 swap timing summary (frame_pacing.h):
++ * {"cmd":"present_pacing","reset":1} clears the ring after reading. */
++static void handle_present_pacing(int id, const char *json)
++{
++    static char buf[2048];
++    present_pacing_json(buf, (int)sizeof buf, json_get_int(json, "reset", 0));
++    send_fmt("{\"id\":%d,\"ok\":true,\"pacing\":%s}", id, buf);
++}
++
+ /* geom_correction — is [video] geometry_correction / perspective_texturing
+  * actually doing anything on THIS title?
+  *
+@@ -15824,6 +15834,7 @@ static const CmdEntry s_commands[] = {
+     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
+     { "write_ram",         handle_write_ram },
+     { "pass_worker_stats", handle_pass_worker_stats },
++    { "present_pacing",    handle_present_pacing },
+     { "gpu_state",         handle_gpu_state },
+     { "geom_correction",   handle_geom_correction },
+     { "pgxp",              handle_pgxp },
+diff --git a/runtime/src/frame_interpolation.c b/runtime/src/frame_interpolation.c
+index 0b4576ed..f6203ccb 100644
+--- a/runtime/src/frame_interpolation.c
++++ b/runtime/src/frame_interpolation.c
+@@ -7,6 +7,37 @@ void frame_interpolation_schedule_reset(FrameInterpolationSchedule *schedule) {
+     if (schedule) memset(schedule, 0, sizeof(*schedule));
+ }
+ 
++void frame_interpolation_schedule_set_grid(FrameInterpolationSchedule *schedule,
++                                           double origin, double period) {
++    if (!schedule) return;
++    if (!(period > 0.0) || !isfinite(period) || !isfinite(origin)) {
++        schedule->grid_origin = schedule->grid_period = 0.0;
++        return;
++    }
++    schedule->grid_origin = origin;
++    schedule->grid_period = period;
++}
++
++/* A period as whole refreshes of the grid, or 0 when it is not within 2%
++ * of a whole number of them. */
++static double grid_period_of(const FrameInterpolationSchedule *schedule,
++                             double period) {
++    const double g = schedule->grid_period;
++    double n;
++    if (!(g > 0.0)) return 0.0;
++    n = floor(period / g + 0.5);
++    if (n < 1.0 || fabs(period / g - n) > 0.02 * n) return 0.0;
++    return n * g;
++}
++
++/* The grid point nearest x (x itself off the grid). */
++static double grid_snap(const FrameInterpolationSchedule *schedule, double x) {
++    const double g = schedule->grid_period;
++    if (!(g > 0.0)) return x;
++    return schedule->grid_origin +
++           floor((x - schedule->grid_origin) / g + 0.5) * g;
++}
++
+ int frame_interpolation_schedule_begin(FrameInterpolationSchedule *schedule,
+                                        uint64_t now, uint64_t frequency,
+                                        double source_hz, double target_hz) {
+@@ -36,6 +67,19 @@ int frame_interpolation_schedule_begin_phase(FrameInterpolationSchedule *schedul
+ 
+     source_period = (double)frequency / source_hz;
+     target_period = (double)frequency / target_hz;
++    if (schedule->grid_period > 0.0) {
++        /* Lock only when both are whole refreshes: snapping a 2.4-refresh
++         * interval would round every one of them to 2 and speed the game
++         * up. Off the grid the host timer schedule stays as it was. */
++        const double s = grid_period_of(schedule, source_period);
++        const double t = grid_period_of(schedule, target_period);
++        if (s > 0.0 && t > 0.0) {
++            source_period = s;
++            target_period = t;
++        } else {
++            schedule->grid_period = 0.0;
++        }
++    }
+     if (source_period < 1.0 || target_period < 1.0) {
+         frame_interpolation_schedule_reset(schedule);
+         return 0;
+@@ -48,11 +92,17 @@ int frame_interpolation_schedule_begin_phase(FrameInterpolationSchedule *schedul
+         now_d + source_period < schedule->source_deadline ||
+         now_d > schedule->source_deadline + source_period * 4.0) {
+         schedule->frame_start = now_d;
+-        schedule->source_deadline = now_d + source_period;
+-        schedule->next_present_deadline = now_d + target_period;
++        schedule->source_deadline = grid_snap(schedule, now_d + source_period);
++        schedule->next_present_deadline =
++            grid_snap(schedule, now_d + target_period);
+     } else {
+         schedule->frame_start = schedule->source_deadline;
+-        schedule->source_deadline += source_period;
++        /* On a grid, re-snapping each interval keeps the deadlines on the
++         * display's clock as the host timer drifts against it. */
++        schedule->source_deadline =
++            grid_snap(schedule, schedule->source_deadline + source_period);
++        schedule->next_present_deadline =
++            grid_snap(schedule, schedule->next_present_deadline);
+     }
+ 
+     schedule->frame_end = schedule->source_deadline;
+diff --git a/runtime/src/frame_pacing.c b/runtime/src/frame_pacing.c
+index be30e5af..9cb7f925 100644
+--- a/runtime/src/frame_pacing.c
++++ b/runtime/src/frame_pacing.c
+@@ -3,6 +3,7 @@
+  * See frame_pacing.h for the Bug B history this replaces.
+  */
+ #include "frame_pacing.h"
++#include <math.h>
+ 
+ /* FRAME_PACING_PURE_ONLY: tests compile only the SDL-free decision
+  * function (tests/test_frame_pacing.c includes this file directly). */
+@@ -75,3 +76,190 @@ void frame_pacer_wait(FramePacer *p, double period_ms) {
+     p->next_deadline += period;
+ }
+ #endif /* FRAME_PACING_PURE_ONLY */
++
++#ifndef FRAME_PACING_PURE_ONLY
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#pragma pack(push, 1)   /* dwmapi.h packs DWM_TIMING_INFO */
++typedef struct PpDwmTiming {   /* DWM_TIMING_INFO */
++    UINT32 cbSize;
++    struct { UINT32 uiNumerator, uiDenominator; } rateRefresh;
++    UINT64 qpcRefreshPeriod;
++    struct { UINT32 uiNumerator, uiDenominator; } rateCompose;
++    UINT64 qpcVBlank;
++    UINT64 cRefresh;
++    UINT32 cDXRefresh;
++    UINT64 qpcCompose;
++    UINT64 cFrame;
++    UINT32 cDXPresent;
++    UINT64 cRefreshFrame;
++    UINT64 cFrameSubmitted;
++    UINT32 cDXPresentSubmitted;
++    UINT64 cFrameConfirmed;
++    UINT32 cDXPresentConfirmed;
++    UINT64 cRefreshConfirmed;
++    UINT32 cDXRefreshConfirmed;
++    UINT64 cFramesLate;
++    UINT32 cFramesOutstanding;
++    UINT64 cFrameDisplayed;
++    UINT64 qpcFrameDisplayed;
++    UINT64 cRefreshFrameDisplayed;
++    UINT64 cFrameComplete;
++    UINT64 qpcFrameComplete;
++    UINT64 cFramePending;
++    UINT64 qpcFramePending;
++    UINT64 cFramesDisplayed;
++    UINT64 cFramesComplete;
++    UINT64 cFramesPending;
++    UINT64 cFramesAvailable;
++    UINT64 cFramesDropped;
++    UINT64 cFramesMissed;
++    UINT64 cRefreshNextDisplayed;
++    UINT64 cRefreshNextPresented;
++    UINT64 cRefreshesDisplayed;
++    UINT64 cRefreshesPresented;
++    UINT64 cRefreshStarted;
++    UINT64 cPixelsReceived;
++    UINT64 cPixelsDrawn;
++    UINT64 cBuffersEmpty;
++} PpDwmTiming;
++#pragma pack(pop)
++typedef LONG (WINAPI *PpDwmGetTiming)(HWND, PpDwmTiming *);
++#endif
++
++int psx_host_vblank_grid(uint64_t *last_vblank, uint64_t *period) {
++#ifdef _WIN32
++    static PpDwmGetTiming fn;
++    static int tried;
++    PpDwmTiming ti;
++    if (!tried) {
++        HMODULE m = LoadLibraryA("dwmapi.dll");
++        tried = 1;
++        if (m) fn = (PpDwmGetTiming)(void *)GetProcAddress(m, "DwmGetCompositionTimingInfo");
++    }
++    if (!fn) return 0;
++    memset(&ti, 0, sizeof ti);
++    ti.cbSize = sizeof ti;
++    if (fn(NULL, &ti) != 0 || !ti.qpcVBlank || !ti.qpcRefreshPeriod) return 0;
++    /* QPC ticks: the same clock as SDL_GetPerformanceCounter on Windows. */
++    *last_vblank = ti.qpcVBlank;
++    *period = ti.qpcRefreshPeriod;
++    return 1;
++#else
++    (void)last_vblank;
++    (void)period;
++    return 0;
++#endif
++}
++
++#define PP_RING 8192u
++static int s_pp_on = -1;
++static uint64_t s_pp_t[PP_RING];      /* swap return, perf ticks */
++static uint64_t s_pp_vb[PP_RING];     /* last compositor vblank at that time */
++static uint64_t s_pp_period[PP_RING]; /* compositor refresh period, ticks */
++static uint64_t s_pp_n;
++static unsigned s_pp_late[6];   /* present start past its deadline: <0.5,<1,<2,<4,<8,>=8 ms */
++
++void present_pacing_note_deadline(uint64_t deadline) {
++    if (s_pp_on <= 0 || !deadline) return;
++    const uint64_t now = SDL_GetPerformanceCounter();
++    const double ms = now > deadline
++        ? (double)(now - deadline) * 1000.0 / (double)SDL_GetPerformanceFrequency() : 0.0;
++    s_pp_late[ms < 0.5 ? 0 : ms < 1 ? 1 : ms < 2 ? 2 : ms < 4 ? 3 : ms < 8 ? 4 : 5]++;
++}
++
++int present_pacing_json(char *out, int cap, int reset);
++
++void present_pacing_note_swap(void) {
++    if (s_pp_on == 0) return;
++    if (s_pp_on < 0) {
++        const char *e = getenv("PSX_PRESENT_PACING");
++        s_pp_on = (e && e[0] && e[0] != '0') ? 1 : 0;
++        if (!s_pp_on) return;
++    }
++    const uint64_t i = s_pp_n % PP_RING;
++    s_pp_t[i] = SDL_GetPerformanceCounter();
++    s_pp_vb[i] = s_pp_period[i] = 0;
++    {
++        uint64_t vb = 0, per = 0;
++        if (psx_host_vblank_grid(&vb, &per)) {
++            s_pp_vb[i] = vb;
++            s_pp_period[i] = per;
++        }
++    }
++    s_pp_n++;
++    {
++        static uint64_t last;
++        const uint64_t now = s_pp_t[i], f = SDL_GetPerformanceFrequency();
++        if (!last) last = now;
++        else if (now - last >= f * 5u) {
++            char buf[1024];
++            last = now;
++            present_pacing_json(buf, (int)sizeof buf, 1);
++            fprintf(stdout, "psxrecomp: present pacing %s\n", buf);
++            fflush(stdout);
++        }
++    }
++}
++
++/* Summary over the recorded swaps: swap-to-swap intervals (ms histogram)
++ * and, with a vblank grid, refreshes each image was on screen (an image is
++ * taken as latched at the first compositor vblank after its swap returned). */
++int present_pacing_json(char *out, int cap, int reset) {
++    const uint64_t n = s_pp_n < PP_RING ? s_pp_n : PP_RING;
++    const uint64_t first = s_pp_n - n;
++    const double f = (double)SDL_GetPerformanceFrequency();
++    unsigned ms_hist[40] = {0}, ref_hist[8] = {0};
++    double sum = 0.0, sum2 = 0.0, mx = 0.0;
++    unsigned cnt = 0, rcnt = 0;
++    int64_t prev_slot = 0;
++    int have_prev_slot = 0;
++    for (uint64_t k = first + 1; k < s_pp_n; k++) {
++        const uint64_t a = s_pp_t[(k - 1) % PP_RING], b = s_pp_t[k % PP_RING];
++        const double ms = (double)(b - a) * 1000.0 / f;
++        unsigned bin = (unsigned)(ms * 2.0);   /* 0.5 ms bins */
++        if (bin > 39) bin = 39;
++        ms_hist[bin]++;
++        sum += ms; sum2 += ms * ms; if (ms > mx) mx = ms;
++        cnt++;
++    }
++    for (uint64_t k = first; k < s_pp_n; k++) {
++        const uint64_t i = k % PP_RING;
++        if (!s_pp_period[i] || !s_pp_vb[i]) { have_prev_slot = 0; continue; }
++        /* Slot index on the grid anchored at this sample's last vblank. */
++        const uint64_t t = s_pp_t[i], vb = s_pp_vb[i], per = s_pp_period[i];
++        int64_t slot = (int64_t)(vb / per) + (t >= vb ? (int64_t)((t - vb) / per) + 1 : 0);
++        if (have_prev_slot) {
++            int64_t d = slot - prev_slot;
++            if (d < 0) d = 0;
++            if (d > 7) d = 7;
++            ref_hist[d]++;
++            rcnt++;
++        }
++        prev_slot = slot;
++        have_prev_slot = 1;
++    }
++    const double mean = cnt ? sum / cnt : 0.0;
++    const double sd = cnt ? sqrt(sum2 / cnt - mean * mean > 0 ? sum2 / cnt - mean * mean : 0) : 0.0;
++    int pos = snprintf(out, (size_t)cap,
++        "{\"on\":%d,\"swaps\":%u,\"mean_ms\":%.3f,\"sd_ms\":%.3f,\"max_ms\":%.3f,"
++        "\"refresh_ms\":%.3f,\"refreshes_per_image\":[",
++        s_pp_on > 0, cnt, mean, sd, mx,
++        n && s_pp_period[(s_pp_n - 1) % PP_RING]
++            ? (double)s_pp_period[(s_pp_n - 1) % PP_RING] * 1000.0 / f : 0.0);
++    for (int b = 0; b < 8 && pos < cap - 16; b++)
++        pos += snprintf(out + pos, (size_t)(cap - pos), "%s%u", b ? "," : "", ref_hist[b]);
++    pos += snprintf(out + pos, (size_t)(cap - pos), "],\"images\":%u,\"ms_hist_half\":[", rcnt);
++    for (int b = 0; b < 40 && pos < cap - 16; b++)
++        pos += snprintf(out + pos, (size_t)(cap - pos), "%s%u", b ? "," : "", ms_hist[b]);
++    pos += snprintf(out + pos, (size_t)(cap - pos), "],\"late\":[%u,%u,%u,%u,%u,%u]}",
++                    s_pp_late[0], s_pp_late[1], s_pp_late[2], s_pp_late[3],
++                    s_pp_late[4], s_pp_late[5]);
++    if (reset) { s_pp_n = 0; memset(s_pp_late, 0, sizeof s_pp_late); }
++    return pos;
++}
++#endif /* FRAME_PACING_PURE_ONLY */
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 88495aca..70f00d94 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -7793,6 +7793,50 @@ static void interp_wait_until(uint64_t deadline, uint64_t frequency) {
+     }
+ }
+ 
++/* Lock the presenter to the display's refresh (PSX_INTERP_REFRESH_LOCK=0
++ * turns it off, 2 locks without vsync). Presented on a host timer alone, a 60/s schedule beats
++ * against a 120 Hz display: measured on a 120 Hz panel, only 40-80% of the
++ * images stayed the intended two refreshes, the rest one or three, a
++ * visible judder while the frame counter says 60. With the display's grid
++ * every deadline sits half a refresh before a vblank (room for the present's
++ * GPU work and no tear or latch race at the boundary), and the swap waits for
++ * vblank so a fullscreen flip cannot tear mid-screen. The schedule only
++ * locks when the guest and output rates are within 2% of whole refreshes
++ * (59.94 guest frames/s become 60 on a 60/120/240 Hz panel, as the stock
++ * sync-to-host-refresh path does); otherwise it keeps the host timer. */
++static int s_interp_lock_on = -1;
++static int s_interp_lock_swap;   /* 1 while the lock holds vsync on */
++static uint64_t s_interp_lock_per;
++static void interp_lock_to_refresh(uint64_t frequency) {
++    uint64_t vb = 0, per = 0;
++    if (s_interp_lock_on < 0) {
++        const char *e = getenv("PSX_INTERP_REFRESH_LOCK");
++        s_interp_lock_on = (e && e[0]) ? atoi(e) : 1;
++    }
++    if (s_interp_lock_on && frequency && psx_host_vblank_grid(&vb, &per) &&
++        per > frequency / 1000u && per < frequency / 20u) {
++        const double lead = (double)per * 0.5;
++        frame_interpolation_schedule_set_grid(&s_interp_schedule,
++                                              (double)vb - lead, (double)per);
++        s_interp_lock_per = per;
++    } else {
++        frame_interpolation_schedule_set_grid(&s_interp_schedule, 0.0, 0.0);
++    }
++}
++
++/* After begin_phase: it keeps the grid only when the rates are whole
++ * refreshes. Vsync follows, so an unlocked schedule never waits in a swap. */
++static void interp_lock_apply_swap(uint64_t frequency) {
++    const int locked = s_interp_schedule.grid_period > 0.0;
++    if (locked == s_interp_lock_swap || s_pt_on) return;
++    if (s_interp_lock_on != 2) SDL_GL_SetSwapInterval(locked ? 1 : s_swap_interval);
++    s_interp_lock_swap = locked;
++    fprintf(stdout, "psxrecomp: GL temporal blending %s the display refresh "
++            "(%.3f ms)\n", locked ? "locked to" : "not locked to",
++            s_interp_lock_per && frequency
++                ? (double)s_interp_lock_per * 1000.0 / (double)frequency : 0.0);
++}
++
+ static void interp_present_source_interval(void) {
+     static uint64_t diag_start, diag_swaps, diag_captures;
+     uint64_t frequency = SDL_GetPerformanceFrequency();
+@@ -7800,17 +7844,20 @@ static void interp_present_source_interval(void) {
+     uint64_t deadline;
+     float alpha;
+ 
++    interp_lock_to_refresh(frequency);
+     if (!frame_interpolation_schedule_begin_phase(
+             &s_interp_schedule, now, frequency,
+             s_interp_source_hz, s_interp_target_hz,
+             s_interp_phase_lo, s_interp_phase_hi))
+         return;
++    interp_lock_apply_swap(frequency);
+     pass_apply_promotion();
+ 
+     while (frame_interpolation_schedule_next(
+                &s_interp_schedule, SDL_GetPerformanceCounter(),
+                &deadline, &alpha)) {
+         interp_wait_until(deadline, frequency);
++        present_pacing_note_deadline(deadline);
+         latency_ring_mark(LAT_SWAP_BEGIN);
+         if (!pass_gen_present(deadline))
+             (void)interp_present(alpha);
+@@ -9078,6 +9125,7 @@ void gl_renderer_pass_service_presents(void) {
+     while (frame_interpolation_schedule_due(
+                &s_interp_schedule, SDL_GetPerformanceCounter(),
+                s_interp_schedule.frame_end + sp, &deadline)) {
++        present_pacing_note_deadline(deadline);
+         latency_ring_mark(LAT_SWAP_BEGIN);
+         if (!pass_gen_present(deadline)) { latency_ring_mark(LAT_SWAP_END); break; }
+         latency_ring_mark(LAT_SWAP_END);
+@@ -9480,7 +9528,7 @@ static int pt_cb_ctx(void *user, int current) {
+ 
+ /* The one owned swap call: the composing thread's (direct) or the present
+  * thread's. */
+-static void gl_window_swap(void) { SDL_GL_SwapWindow(s_win); }
++static void gl_window_swap(void) { SDL_GL_SwapWindow(s_win); present_pacing_note_swap(); }
+ 
+ static void *pt_cb_present(void *user, int slot, void *ready) {
+     (void)user;
+diff --git a/runtime/tests/test_frame_interpolation_schedule.c b/runtime/tests/test_frame_interpolation_schedule.c
+index 8b508347..dd5f0f13 100644
+--- a/runtime/tests/test_frame_interpolation_schedule.c
++++ b/runtime/tests/test_frame_interpolation_schedule.c
+@@ -240,7 +240,48 @@ static void test_flip_rates(void) {
+     }
+ }
+ 
++/* Refresh grid: a 59.94 Hz guest at 60 presents/s on a 120 Hz display, the
++ * host clock 0.1% off the display's. Every present sits on the grid, exactly
++ * two refreshes apart, however the two clocks drift. A rate off whole
++ * refreshes (60 on 144 Hz) leaves the grid off and the old cadence. */
++static void test_refresh_grid(void) {
++    FrameInterpolationSchedule s;
++    const double f = 10000000.0, per = f / 120.0 * 1.001, lead = per * 0.5;
++    double vb = 12345.0, prev = 0.0, now = 1000000.0;
++    int presents = 0, spaced = 1, on_grid = 1;
++    frame_interpolation_schedule_reset(&s);
++    for (int i = 0; i < 2000; i++) {
++        uint64_t d;
++        float a;
++        while (vb + per <= now) vb += per;   /* the display's last vblank */
++        frame_interpolation_schedule_set_grid(&s, vb - lead, per);
++        CHECK(frame_interpolation_schedule_begin(&s, (uint64_t)now, (uint64_t)f,
++                                                 59.94, 60.0),
++              "grid begin");
++        CHECK(s.grid_period > 0.0, "59.94/60 on 120 Hz should lock");
++        while (frame_interpolation_schedule_next(&s, (uint64_t)now, &d, &a)) {
++            const double k = ((double)d - (vb - lead)) / per;
++            if (fabs(k - floor(k + 0.5)) > 1e-3) on_grid = 0;
++            if (prev > 0.0 && fabs(((double)d - prev) / per - 2.0) > 1e-3) spaced = 0;
++            prev = (double)d;
++            presents++;
++            now = (double)d + 2000.0;
++        }
++        now = (double)frame_interpolation_schedule_end(&s) + 3000.0;
++    }
++    CHECK(presents == 2000, "one present per guest frame at 60 on 120 Hz");
++    CHECK(on_grid, "presents sit on the refresh grid");
++    CHECK(spaced, "presents are exactly two refreshes apart");
++
++    frame_interpolation_schedule_reset(&s);
++    frame_interpolation_schedule_set_grid(&s, 0.0, f / 144.0);
++    CHECK(frame_interpolation_schedule_begin(&s, 1000000u, (uint64_t)f, 59.94, 60.0),
++          "off-grid begin");
++    CHECK(s.grid_period == 0.0, "60 presents/s on 144 Hz must not lock");
++}
++
+ int main(void) {
++    test_refresh_grid();
+     test_flip_tracker_table();
+     test_flip_new_frame();
+     test_phase_windows();
+-- 
+2.55.0.windows.5
+

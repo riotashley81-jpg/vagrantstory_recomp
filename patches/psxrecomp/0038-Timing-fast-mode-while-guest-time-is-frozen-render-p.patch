@@ -1,0 +1,137 @@
+From c1c0f4f67c43d2983c195cce4f14bbec05765720 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 22 Oct 2026 21:52:29 +0200
+Subject: [PATCH] Timing: fast mode while guest time is frozen (render passes)
+
+g_psx_cyc_fast is set by psx_cycle_freeze_begin and cleared by
+psx_cycle_freeze_end. While it is set, compiled code skips the
+per-instruction load-delay/interlock model (psx_cyc_step and the inline
+load helpers) and the i-cache model, without a call per site: nothing
+charged inside a pass is kept, since the clock is restored afterwards.
+A render pass of Vagrant Story's scene draw goes from 11.3 to 8.6 ms of
+guest code with PSX_RENDER_PASS_VERIFY mismatch 0. Normal play is
+untouched. psx_cyc.h and psx_cycles.h are codegen-hashed: the hash moves
+(emitted code is unchanged, so savestates can be re-tagged).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/psx_cyc.h    | 9 ++++++---
+ runtime/include/psx_cycles.h | 6 ++++++
+ runtime/include/psx_icache.h | 6 ++++++
+ runtime/src/psx_cycles.c     | 3 +++
+ runtime/src/psx_icache.c     | 1 +
+ 5 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/include/psx_cyc.h b/runtime/include/psx_cyc.h
+index 6022535d..5c2d7a4d 100644
+--- a/runtime/include/psx_cyc.h
++++ b/runtime/include/psx_cyc.h
+@@ -229,11 +229,14 @@ static inline void psx_cyc_lds(CPUState* cpu) {
+  * branch, jump, store, COP control, LWC2/SWC2 pre-step, mult/div, mfhi/mflo, ...).
+  * reg_mask from psx_cyc_dep_res_mask(). MUST be emitted BEFORE the instruction
+  * body so §1 precedes any muldiv/GTE deadline stall in the body (Beetle order). */
+-static inline void psx_cyc_step(CPUState* cpu, uint32_t reg_mask) {
++static inline void psx_cyc_step_full(CPUState* cpu, uint32_t reg_mask) {
+     psx_cyc_base(cpu);
+     psx_cyc_deps(cpu, reg_mask);
+     psx_cyc_lds(cpu);
+ }
++/* Fast timing (g_psx_cyc_fast, psx_cycles.h): while guest time is frozen the
++ * per-instruction interlock model is skipped, without a call per site. */
++#define psx_cyc_step(cpu_, mask_)     do { if (!g_psx_cyc_fast) psx_cyc_step_full((cpu_), (mask_)); } while (0)
+ 
+ /* The GPR dep+res bitmask used by psx_cyc_step lives in psx_instr_cost.h
+  * (psx_cyc_dep_res_mask) — a standalone pure function shared by the emitters
+@@ -266,7 +269,7 @@ static inline uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr,
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+-        if (g_psx_load_delay) {
++        if (g_psx_load_delay && !g_psx_cyc_fast) {
+             psx_cyc_base(cpu);
+             psx_cyc_deps(cpu, reg_mask);
+             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+@@ -296,7 +299,7 @@ static inline uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr,
+     uint32_t phys = addr & 0x1FFFFFFFu;
+     if (g_ls_mode == 0 && !g_ds_recording && phys < 0x00800000u) {
+         if (g_psx_load_delay < 0) (void)psx_load_delay_enabled();
+-        if (g_psx_load_delay) {
++        if (g_psx_load_delay && !g_psx_cyc_fast) {
+             psx_cyc_base(cpu);
+             psx_cyc_deps(cpu, reg_mask);
+             if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;
+diff --git a/runtime/include/psx_cycles.h b/runtime/include/psx_cycles.h
+index 6981984a..a6169cbf 100644
+--- a/runtime/include/psx_cycles.h
++++ b/runtime/include/psx_cycles.h
+@@ -66,6 +66,12 @@ extern uint32_t g_psx_cyc_batch_limit;
+  * -- so every writer of the batch, its limit or a special mode clears it. */
+ extern uint32_t g_psx_cyc_fast_limit;
+ 
++/* Fast timing: nonzero while guest time is frozen (render passes,
++ * psx_cycle_freeze.h). Compiled code then skips the per-instruction
++ * load-delay/interlock model and the i-cache model; nothing is charged for
++ * them, as nothing would be kept. Set only by psx_cycle_freeze_begin/end. */
++extern int g_psx_cyc_fast;
++
+ /* MSVC stops inlining inside the huge recompiled functions. Only the tiny
+  * charge front (psx_cyc.h) is forced: it lands in the out-of-line
+  * psx_cyc_step / load helper bodies, not at every instruction. Forcing those
+diff --git a/runtime/include/psx_icache.h b/runtime/include/psx_icache.h
+index e45b9381..65802981 100644
+--- a/runtime/include/psx_icache.h
++++ b/runtime/include/psx_icache.h
+@@ -13,6 +13,12 @@ extern int g_ls_replay_active;
+ void psx_icache_reset(void);
+ void psx_icache_fetch(CPUState *cpu, uint32_t addr);
+ void psx_icache_fetch_miss(CPUState *cpu, uint32_t addr);
++/* Fast timing (psx_cycles.h g_psx_cyc_fast): no i-cache model while guest time
++ * is frozen, and no call per compiled block for it. */
++extern int g_psx_cyc_fast;
++#if !defined(PSX_ICACHE_IMPL) && !defined(PSX_OVERLAY_DLL_BUILD)
++#define psx_icache_fetch(cpu_, addr_)     do { if (!g_psx_cyc_fast) (psx_icache_fetch)((cpu_), (addr_)); } while (0)
++#endif
+ 
+ /* BIU / cache control (0xFFFE0130) bits the cache model reads; names and values
+  * as Beetle's cpu.cpp BIU_* defines. */
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index 789e3516..e01e949c 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -135,6 +135,7 @@ static uint64_t s_cycle_replay_live = 0;
+ /* ---- guest-time freeze: render passes and uncharged calls
+  * (see psx_cycle_freeze.h) ---- */
+ int g_psx_render_pass_active = 0;
++int g_psx_cyc_fast = 0;   /* psx_cycles.h */
+ int g_psx_guest_time_frozen = 0;
+ static uint64_t s_freeze_start = 0;
+ static uint64_t s_freeze_limit = 0;
+@@ -1035,11 +1036,13 @@ int psx_cycle_freeze_begin(PsxCycleFreeze *save, uint64_t watchdog_cycles,
+     s_freeze_overrun = overrun;
+     g_psx_render_pass_active = 1;
+     g_psx_guest_time_frozen = 1;
++    g_psx_cyc_fast = 1;
+     psx_cycle_freeze_tick();
+     return 1;
+ }
+ 
+ void psx_cycle_freeze_end(const PsxCycleFreeze *save) {
++    g_psx_cyc_fast = 0;
+     g_psx_render_pass_active = 0;
+     g_psx_guest_time_frozen = 0;
+     s_freeze_overrun = 0;
+diff --git a/runtime/src/psx_icache.c b/runtime/src/psx_icache.c
+index 60749aa4..a3bf77d2 100644
+--- a/runtime/src/psx_icache.c
++++ b/runtime/src/psx_icache.c
+@@ -5,6 +5,7 @@
+  *
+  * HIT path is inlined in psx_icache.h; this file owns reset + MISS refill.
+  */
++#define PSX_ICACHE_IMPL
+ #include "psx_icache.h"
+ #include "cpu_state.h"
+ #include "psx_cycles.h"
+-- 
+2.55.0.windows.5
+

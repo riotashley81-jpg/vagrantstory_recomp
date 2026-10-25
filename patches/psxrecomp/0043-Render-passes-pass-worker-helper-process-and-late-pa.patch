@@ -1,0 +1,970 @@
+From 4924464e1654dea23882314b073a253ccccc0a3d Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 13:17:42 +0200
+Subject: [PATCH] Render passes: pass worker helper process and late passes
+
+A title can run a pass's guest work in a second copy of the executable
+(--pass-worker, headless) on another core. The main process submits the
+kept machine state and a job; the helper loads it as a savestate load
+would, runs the job with guest time frozen and returns the RAM pages,
+scratchpad and PGXP shadows it changed. psx_mod_render_pass_open opens a
+frame's generation without a pass, and psx_mod_render_pass_late adds an
+image to it once the result is in, even after the flip. Motion sets can
+export their blended values for the helper (psx_motion_export).
+
+Generations are now dumped (render_pass_dump) when they leave the screen,
+so late images are included. TCP pass_worker_stats.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ docs/RENDER_PASSES.md                |  36 +++
+ runtime/include/gpu_gl_renderer.h    |   3 +
+ runtime/include/mod_plugins.h        |  56 ++++
+ runtime/include/render_pass_motion.h |  10 +
+ runtime/runtime.cmake                |   1 +
+ runtime/src/debug_server.c           |  16 ++
+ runtime/src/gpu_gl_renderer.c        |  37 ++-
+ runtime/src/main.cpp                 |  28 +-
+ runtime/src/pass_worker.c            | 392 +++++++++++++++++++++++++++
+ runtime/src/pgxp.cpp                 |  37 +++
+ runtime/src/render_pass.c            |  27 +-
+ runtime/src/render_pass_motion.c     |  18 ++
+ 12 files changed, 649 insertions(+), 12 deletions(-)
+ create mode 100644 runtime/src/pass_worker.c
+
+diff --git a/docs/RENDER_PASSES.md b/docs/RENDER_PASSES.md
+index 3e687be4..c1ad4344 100644
+--- a/docs/RENDER_PASSES.md
++++ b/docs/RENDER_PASSES.md
+@@ -130,6 +130,42 @@ per-PC entry statistics, and fires instruction hooks as compiled code does.
+ `render_pass_stats` counts `spans` / `span_failures` and keeps the last
+ failure (`span_fail`: reason, exit PC, `$ra`, post-call PC).
+ 
++## Running the replay in a helper process (pass worker)
++
++A pass that replays the draw section costs about as much host time as the
++game's own draw, on the same thread. A title can move that guest work to a
++second copy of the executable running headless on another core
++(`pass_worker.c`, Windows; `mod_plugins.h` `psx_mod_pass_worker_*`):
++
++- The plugin registers its job function in its constructor
++  (`psx_mod_pass_worker_set_job`); it runs in both processes, and only the
++  helper calls it. `psx_mod_pass_worker_start` launches the helper
++  (`--pass-worker NAME PID --headless`, no debug port, no heartbeat, its
++  console output in `%TEMP%\psxrecomp_pass_worker\helper_log.txt`).
++- At the pass point the plugin plans as usual, opens the frame's generation
++  without running a pass (`psx_mod_render_pass_open`), and submits the kept
++  machine state (main RAM, scratchpad, CPU and GTE registers) with an opaque
++  job: for a blended replay, the values `psx_motion_export` gives, which the
++  helper writes back with `psx_motion_write_value` where the in-process pass
++  would have applied them.
++- The helper loads the state as a savestate load would (RAM, the dirty-code
++  bitmap, then `overlay_watch_invalidate_after_ram_restore`), runs the job
++  with guest time frozen, and returns the 4 KiB RAM pages that changed, the
++  scratchpad and the PGXP shadows the job wrote (`pgxp_pass_export`). Between
++  jobs it lets one frame of device time pass so a transfer a job started
++  never stays busy.
++- Later, once the display shows that frame, the plugin calls
++  `psx_mod_render_pass_late`: its callback restores the kept state, puts the
++  helper's result on top (`psx_mod_pass_worker_apply`, which imports the PGXP
++  shadows through the pass journal) and submits the OT. The image joins the
++  generation on screen, or the pending one if the flip has not been seen yet;
++  an image that misses its phase's deadline is not shown.
++
++`pass_worker_stats` (TCP) reports jobs submitted / done / late / failed, the
++last job's helper time, pages and PGXP slots. A helper that exits (a runaway
++job hits its watchdog) ends the worker for the session; the title falls back
++to in-process passes.
++
+ ## Blending game state (render_pass_motion.h)
+ 
+ What makes a pass an in-between image is the state the draw code reads,
+diff --git a/runtime/include/gpu_gl_renderer.h b/runtime/include/gpu_gl_renderer.h
+index 81f013c9..286b9ddf 100644
+--- a/runtime/include/gpu_gl_renderer.h
++++ b/runtime/include/gpu_gl_renderer.h
+@@ -71,6 +71,9 @@ uint32_t gl_renderer_pass_plan(uint32_t period_vblanks,
+  * no guest code ran since the previous pass ended (its restore left VRAM as
+  * backed up), so the backup of that pass is reused when it covers the same
+  * rect at the same scale. Returns 0 when refused (nothing changed). */
++/* A pass into the generation already on screen (its flip was seen): the
++ * image joins that frame's phases. For passes computed after the flip. */
++int      gl_renderer_pass_begin_late(int x, int y, int w, int h);
+ int      gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
+                                 uint32_t period_vblanks, int reuse_backup);
+ /* Snapshot at the last begin attempt, never reconstructed by a TCP query.
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index 4b1148a1..5ef37aac 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -774,6 +774,62 @@ uint32_t psx_mod_render_pass_frame(struct CPUState* cpu,
+  */
+ int psx_mod_run_guest_span(struct CPUState* cpu, uint32_t start_pc,
+                            uint32_t stop_pc);
++/*
++ * Passes computed after the flip. After psx_mod_render_pass_plan,
++ * psx_mod_render_pass_open opens frame n's generation (its own image) without
++ * running a pass. Once the display has flipped to it,
++ * psx_mod_render_pass_late adds a pass image to that frame, as
++ * psx_mod_render_pass would have before the flip; an image that arrives after
++ * its phase's deadline is simply not shown. For passes whose guest work runs
++ * elsewhere (the pass worker below) and whose result arrives during the next
++ * game frame.
++ */
++int psx_mod_render_pass_open(const PSXModRenderPass* rect);
++int psx_mod_render_pass_late(struct CPUState* cpu, const PSXModRenderPass* pass,
++                             PSXModRenderPassFn fn, void* user);
++
++/*
++ * Render-pass worker (pass_worker.c, Windows): a second copy of the
++ * executable runs headless on another core as a helper process. The main
++ * process submits a machine state (main RAM, scratchpad, CPU and GTE
++ * registers) and an opaque job; the helper loads it, runs the title's job
++ * function with guest time frozen, and hands back what the job changed: the
++ * RAM pages that differ, the scratchpad, and the PGXP shadows it wrote. Inside
++ * a pass in the main process, psx_mod_pass_worker_apply puts those on top of
++ * the same state; the pass then submits the result to the GPU.
++ *
++ * The job function is registered in both processes (a constructor); in the
++ * helper it runs with g_psx_render_pass_active set, like a pass. Only one job
++ * is out at a time. Every call returns 0 when the worker is unavailable
++ * (another platform, a session with more than 2 MiB of RAM, the helper
++ * exited); the title then runs its passes in-process.
++ */
++typedef int (*PSXModPassWorkerJob)(struct CPUState* cpu, const void* user,
++                                   uint32_t len);
++typedef struct PSXModPassWorkerState {
++    const uint8_t* ram;          /* psx_ram_live_bytes() bytes */
++    const uint8_t* scratchpad;   /* 1024 bytes */
++    const uint32_t* gpr;         /* 32 */
++    uint32_t hi, lo;
++    const uint32_t* gte_data;    /* 32 */
++    const uint32_t* gte_ctrl;    /* 32 */
++} PSXModPassWorkerState;
++typedef struct PSXModPassWorkerStats {
++    uint64_t submitted, done, late, failed;
++    double last_job_ms;
++    uint32_t last_pages, last_pgxp;
++    int running, failed_session;
++} PSXModPassWorkerStats;
++int psx_mod_pass_worker_set_job(PSXModPassWorkerJob job);
++int psx_mod_pass_worker_is_helper(void);
++int psx_mod_pass_worker_start(void);
++int psx_mod_pass_worker_submit(const PSXModPassWorkerState* state,
++                               const void* user, uint32_t len);
++/* 1 when the job is done and its result kept, waiting up to wait_ms. */
++int psx_mod_pass_worker_result(uint32_t wait_ms);
++int psx_mod_pass_worker_pending(void);
++int psx_mod_pass_worker_apply(void);
++void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats* out);
+ /*
+  * Declare the back-edge PC of the game's own wait-for-VBlank loop (the resume
+  * PC its interrupt check reports at the top of each iteration). There, with
+diff --git a/runtime/include/render_pass_motion.h b/runtime/include/render_pass_motion.h
+index c28ddc3b..5a58f3c0 100644
+--- a/runtime/include/render_pass_motion.h
++++ b/runtime/include/render_pass_motion.h
+@@ -102,6 +102,16 @@ void psx_motion_apply(const PSXMotionSet* set, double t);
+  * untouched, returns -1). */
+ int psx_motion_blend_at(const PSXMotionSet* set, uint32_t kind, uint32_t addr,
+                         double t, void* out);
++/* What psx_motion_apply(set, t) would write, as values: for replaying the
++ * blend in another machine (the render-pass helper process). Ascending by
++ * (addr, kind). Returns the count, 0 when more than max. */
++typedef struct PSXMotionValue {
++    uint32_t kind, addr;
++    int32_t  v[12];
++} PSXMotionValue;
++uint32_t psx_motion_export(const PSXMotionSet* set, double t,
++                           PSXMotionValue* out, uint32_t max);
++void psx_motion_write_value(const PSXMotionValue* value);
+ /* Forget all history (scene change, load, a frame the plugin skipped). */
+ void psx_motion_invalidate(PSXMotionSet* set);
+ 
+diff --git a/runtime/runtime.cmake b/runtime/runtime.cmake
+index 83f07b91..fa514f0e 100644
+--- a/runtime/runtime.cmake
++++ b/runtime/runtime.cmake
+@@ -400,6 +400,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
+     ${PSXRECOMP_ROOT}/runtime/src/render_pass_motion.c
+     ${PSXRECOMP_ROOT}/runtime/src/render_pass_projection.cpp
+     ${PSXRECOMP_ROOT}/runtime/src/render_pass_frame.c
++    ${PSXRECOMP_ROOT}/runtime/src/pass_worker.c
+     ${PSXRECOMP_ROOT}/runtime/src/dynamic_resolution.c
+     ${PSXRECOMP_ROOT}/runtime/src/host_time.c
+     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
+diff --git a/runtime/src/debug_server.c b/runtime/src/debug_server.c
+index 2bd63b05..a656a32a 100644
+--- a/runtime/src/debug_server.c
++++ b/runtime/src/debug_server.c
+@@ -8859,6 +8859,21 @@ static void handle_render_pass_stats(int id, const char *json)
+              (unsigned long long)sf.insns);
+ }
+ 
++/* pass_worker_stats: the render-pass helper process (pass_worker.c). */
++static void handle_pass_worker_stats(int id, const char *json)
++{
++    PSXModPassWorkerStats w;
++    (void)json;
++    psx_mod_pass_worker_get_stats(&w);
++    send_fmt("{\"id\":%d,\"ok\":true,\"submitted\":%llu,\"done\":%llu,"
++             "\"late\":%llu,\"failed\":%llu,\"last_job_ms\":%.3f,"
++             "\"last_pages\":%u,\"last_pgxp\":%u,\"running\":%d,"
++             "\"failed_session\":%d}", id,
++             (unsigned long long)w.submitted, (unsigned long long)w.done,
++             (unsigned long long)w.late, (unsigned long long)w.failed,
++             w.last_job_ms, w.last_pages, w.last_pgxp, w.running, w.failed_session);
++}
++
+ /* render_pass_refuse on=<0|1>: make the OpenGL backend decline render passes
+  * (status BACKEND), as a renderer mode without them would; for testing a
+  * plugin's fallback. Same as PSX_RENDER_PASS_REFUSE=1 at start. */
+@@ -15808,6 +15823,7 @@ static const CmdEntry s_commands[] = {
+     { "read_ram",          handle_read_ram },
+     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
+     { "write_ram",         handle_write_ram },
++    { "pass_worker_stats", handle_pass_worker_stats },
+     { "gpu_state",         handle_gpu_state },
+     { "geom_correction",   handle_geom_correction },
+     { "pgxp",              handle_pgxp },
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 27c939d5..88495aca 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -8399,10 +8399,21 @@ static void pass_journal_rollback(void) {
+     render_pass_journal_rollback(&s_pj_cpu, s_vram, VRAM_W);
+ }
+ 
+-/* kind: 0 temporal pass, 1 stereo eye, 2 netplay local view. */
++/* kind: 0 temporal pass, 1 stereo eye, 2 netplay local view, 3 late temporal
++ * pass (into the generation on screen, gl_renderer_pass_begin_late). */
++static int s_pass_late = 0;
+ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+                               uint32_t period_vblanks, int reuse_backup, int kind) {
+     const int stereo = kind == 1, local = kind == 2;
++    int late = kind == 3;
++    /* A late pass whose frame the display has not flipped to yet is an
++     * ordinary pass into the pending generation. */
++    if (late) {
++        const PassGen *pend = &s_pgen[1 - s_pgen_cur];
++        if (pend->valid && !pend->promoted && pend->rx == x && pend->ry == y &&
++            pend->rw == w && pend->rh == h)
++            late = 0;
++    }
+     int S = s_hr_scale, gi, wide, tw, th;
+     PassGen *g;
+     memset(&s_pass_begin_diag, 0, sizeof s_pass_begin_diag);
+@@ -8416,7 +8427,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+     s_pass_begin_diag.source_path = s_interp_source_path;
+     s_pass_begin_diag.capture_w = s_interp_w;
+     s_pass_begin_diag.capture_h = s_interp_h;
+-    gi = 1 - s_pgen_cur;
++    gi = late ? s_pgen_cur : 1 - s_pgen_cur;
+     g = &s_pgen[gi];
+     s_pass_begin_diag.generation = gi;
+     s_pass_begin_diag.valid = g->valid;
+@@ -8452,7 +8463,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+     s_pass_begin_diag.wide = wide;
+     s_pass_begin_diag.requested_w = tw;
+     s_pass_begin_diag.requested_h = th;
+-    gi = 1 - s_pgen_cur;
++    gi = late ? s_pgen_cur : 1 - s_pgen_cur;
+     g = &s_pgen[gi];
+     if (local) {
+         /* No generation: the image stays in the presenter surface. */
+@@ -8475,6 +8486,10 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+         g->phase[0] = 0;
+         g->n = 1;
+         g->valid = 1;
++    } else if (late) {
++        if (!g->valid || !g->promoted || g->rx != x || g->ry != y ||
++            g->rw != w || g->rh != h)
++            return pass_begin_refuse("late_generation_state");
+     } else if (!g->valid || g->promoted || g->rx != x || g->ry != y ||
+                g->rw != w || g->rh != h) {
+         return pass_begin_refuse("generation_state");
+@@ -8548,6 +8563,7 @@ backed_up:
+     s_pj_cpu.n = 0;
+     s_pass_active = 1;
+     s_pass_local = local;
++    s_pass_late = late;
+     return 1;
+ }
+ 
+@@ -8640,17 +8656,23 @@ int gl_renderer_pass_begin(int x, int y, int w, int h, int open_gen,
+     GL_RT_SYNC("pass_begin");
+     return transaction_begin(x, y, w, h, open_gen, period, reuse, 0);
+ }
++int gl_renderer_pass_begin_late(int x, int y, int w, int h) {
++    GL_RT_SYNC("pass_begin_late");
++    return transaction_begin(x, y, w, h, 0, 0, 0, 3);
++}
+ int gl_renderer_stereo_begin(int x, int y, int w, int h, int reuse) {
+     GL_RT_SYNC("stereo_begin");
+     return transaction_begin(x, y, w, h, 0, 0, reuse, 1);
+ }
+ void gl_renderer_pass_end(uint32_t alpha_q16, int keep) {
+     GL_RT_SYNC("pass_end");
+-    int gi = 1 - s_pgen_cur;
++    const int late = s_pass_late;
++    int gi = late ? s_pgen_cur : 1 - s_pgen_cur;
+     PassGen *g = &s_pgen[gi];
+     if (!s_pass_active) return;
++    s_pass_late = 0;
+     flush_flat_batch(); flush_tex_batch(); flush_cpu_upload();
+-    if (keep && alpha_q16 && g->valid && !g->promoted && g->n < PASS_SLOTS &&
++    if (keep && alpha_q16 && g->valid && g->promoted == late && g->n < PASS_SLOTS &&
+         g->n < pass_slot_cap(g->tex_w, g->tex_h) &&
+         pass_gen_reserve(gi, g->n + 1u, g->tex_w, g->tex_h)) {
+         uint32_t slot = g->n, at = g->n;
+@@ -9166,6 +9188,10 @@ static void pass_apply_promotion(void) {
+     s_intervals_since_plan++;
+     if (!s_pgen_promote) return;
+     s_pgen_promote = 0;
++    /* Dump a generation when it leaves the screen: late passes
++     * (gl_renderer_pass_begin_late) have joined it by then. */
++    if (s_pdump_left > 0 && s_pgen[s_pgen_cur].valid && s_pgen[s_pgen_cur].promoted)
++        pass_dump_generation(s_pgen_cur);
+     s_pgen[s_pgen_cur].valid = 0;
+     s_pgen[s_pgen_cur].promoted = 0;
+     s_pgen_cur = 1 - s_pgen_cur;
+@@ -9189,7 +9215,6 @@ static void pass_apply_promotion(void) {
+             p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+         }
+         s_pgen_promotions++;
+-        if (s_pdump_left > 0) pass_dump_generation(s_pgen_cur);
+     }
+ }
+ 
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index 09669bbc..c2f71379 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -43,6 +43,9 @@
+ #include "autocompile.h"
+ #include "code_provider.h"
+ extern "C" void psx_event_step_conservative_env_init(void);
++extern "C" void pass_worker_note_launch(const char *game, const char *disc);
++extern "C" int pass_worker_helper_main(CPUState *cpu, const char *name,
++                                       unsigned long parent_pid);
+ #include "overlay_backend.h"
+ #include "gpu.h"
+ #include "draw_distance.h"
+@@ -15751,6 +15754,10 @@ int main(int argc, char** argv) {
+     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
+     const char* game_config_path = nullptr;
+     const char* disc_override_path = nullptr;
++    /* --pass-worker NAME PID: this process is a render-pass helper
++     * (pass_worker.c) of the game process PID; it serves jobs, never plays. */
++    const char* pass_worker_name = nullptr;
++    unsigned long pass_worker_parent = 0;
+     bool        bios_from_cli = false;  /* CLI --bios/positional wins over settings.toml */
+     /* Did the PLAYER choose this BIOS (CLI or settings), as opposed to it
+      * being the compile-time default? Only a real choice overrides the
+@@ -15854,6 +15861,11 @@ int main(int argc, char** argv) {
+             force_launcher = true;
+         } else if (std::strcmp(argv[i], "--no-launcher") == 0) {
+             force_no_launcher = true;
++        } else if (std::strcmp(argv[i], "--pass-worker") == 0 && i + 2 < argc) {
++            pass_worker_name = argv[++i];
++            pass_worker_parent = std::strtoul(argv[++i], nullptr, 10);
++            g_headless = 1;
++            force_no_launcher = true;
+         } else if (std::strcmp(argv[i], "--headless-opengl") == 0) {
+             g_headless = 1;
+             g_headless_opengl = 1;
+@@ -18325,6 +18337,7 @@ int main(int argc, char** argv) {
+     std::string bios_path_str    = resolved_bios.string();
+     std::string memcard_dir_str  = memcard_dir.string();
+     std::string disc_path_str = session_disc_path(resolved_disc);
++    pass_worker_note_launch(game_config_path, disc_path_str.c_str());
+ 
+ session_reboot:
+     /* Rematch after lobby soft-return re-enters here with updated net_cfg. */
+@@ -18839,8 +18852,11 @@ session_reboot:
+          * armed, so it can't overwrite the saved file with boot defaults. */
+         std::atexit(game_options_save_now);
+ #ifndef PSX_NO_DEBUG_TOOLS
+-        debug_server_init(debug_port);
+-        host_sampler_start();   /* this is the emulation thread */
++        /* A pass-worker helper leaves the port and the heartbeat to its game. */
++        if (!pass_worker_name) {
++            debug_server_init(debug_port);
++            host_sampler_start();   /* this is the emulation thread */
++        }
+ #else
+         (void)debug_port;
+ #endif
+@@ -18848,7 +18864,7 @@ session_reboot:
+         cosim_init();  /* first-divergence oracle server */
+ #endif
+         /* Heartbeat always on — see freeze_heartbeat.c rationale. */
+-        freeze_heartbeat_start("psx-runtime");
++        if (!pass_worker_name) freeze_heartbeat_start("psx-runtime");
+     } else {
+ #ifndef PSX_NO_DEBUG_TOOLS
+         (void)debug_port;
+@@ -19577,6 +19593,12 @@ session_reboot:
+     /* Solo rollback resim self-check (PSX_RB_SELFCHECK=1, offline only). */
+     psx_selfcheck_init(&cpu, memory_get_bios_checksum(), game_entry_pc);
+ 
++    if (pass_worker_name) {
++        std::fflush(stdout);
++        /* No atexit work: the run report and saves belong to the game. */
++        std::_Exit(pass_worker_helper_main(&cpu, pass_worker_name, pass_worker_parent));
++    }
++
+     /* Execute. */
+     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
+ 
+diff --git a/runtime/src/pass_worker.c b/runtime/src/pass_worker.c
+new file mode 100644
+index 00000000..2798ab04
+--- /dev/null
++++ b/runtime/src/pass_worker.c
+@@ -0,0 +1,392 @@
++/* Render-pass worker (mod_plugins.h psx_mod_pass_worker_*).
++ *
++ * A render pass re-runs guest draw code on the emulation thread, between the
++ * game's own frames: the two take turns on one core. The runtime cannot run a
++ * second machine on another thread of the same process (generated code and
++ * the devices live in globals), so a second copy of the executable runs as a
++ * helper process, headless, with no game of its own. Per job the main process
++ * hands it a machine state (main RAM, scratchpad, CPU and GTE registers) and
++ * an opaque job description; the helper loads the state, runs the title's job
++ * function with guest time frozen, as a pass would, and hands back what the
++ * job changed: the 4 KiB RAM pages that differ, the scratchpad and the PGXP
++ * shadows it wrote. Inside a pass the main process puts those on top of the
++ * same state and submits the result to its GPU, which costs a fraction of
++ * running the draw code. The helper works while the main thread runs the
++ * game, on another core.
++ *
++ * Shared memory and events are Windows objects; elsewhere every entry point
++ * reports "unavailable" and titles keep their in-process passes. */
++#include "mod_plugins.h"
++#include "cpu_state.h"
++#include "psx_memory.h"
++#include "psx_cycle_freeze.h"
++#include "psx_cycles.h"
++#include "psx_video_timing.h"
++
++#include <setjmp.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++extern uint8_t *memory_get_ram_ptr(void);
++extern uint32_t i_stat;
++extern uint8_t *memory_get_scratchpad_ptr(void);
++extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
++extern uint32_t dirty_ram_get_bitmap_word_count(void);
++extern void     dirty_ram_set_bitmap_words(const uint32_t *words, uint32_t count);
++extern void     overlay_watch_invalidate_after_ram_restore(void);
++extern uint32_t pgxp_pass_export(uint32_t *index, void *values, uint32_t cap);
++extern void     pgxp_pass_import(const uint32_t *index, const void *values, uint32_t n);
++extern uint32_t pgxp_value_size(void);
++extern void     gte_precision_checkpoint_begin(void);
++extern void     gte_precision_checkpoint_rollback(void);
++
++#define PW_RAM_BYTES   0x200000u      /* retail main RAM; 8 MiB sessions decline */
++#define PW_SPAD_BYTES  1024u
++#define PW_PAGE        4096u
++#define PW_PAGES       (PW_RAM_BYTES / PW_PAGE)
++#define PW_MAX_PAGES   384u
++#define PW_USER_BYTES  (256u * 1024u)
++#define PW_MAX_PGXP    131072u
++#define PW_PGXP_VALUE  48u            /* >= sizeof(PGXPValue), checked at start */
++#define PW_WATCHDOG    8000000u       /* guest cycles, as a pass's watchdog */
++#define PW_DIRTY_WORDS 64u
++
++typedef struct PwShm {
++    volatile long job_seq, done_seq;
++    int32_t  ok;
++    uint32_t gpr[32], hi, lo, gte_data[32], gte_ctrl[32];
++    uint32_t user_len;
++    uint8_t  user[PW_USER_BYTES];
++    uint8_t  ram[PW_RAM_BYTES];
++    uint8_t  spad[PW_SPAD_BYTES];
++    uint32_t dirty_n, dirty[PW_DIRTY_WORDS];   /* code-tracking bitmap */
++    /* result */
++    uint32_t npages;
++    uint16_t page_idx[PW_MAX_PAGES];
++    uint8_t  pages[PW_MAX_PAGES][PW_PAGE];
++    uint8_t  spad_out[PW_SPAD_BYTES];
++    uint32_t npgxp;
++    uint32_t pgxp_idx[PW_MAX_PGXP];
++    uint8_t  pgxp_val[PW_MAX_PGXP * PW_PGXP_VALUE];
++    double   job_ms;
++} PwShm;
++
++static PSXModPassWorkerJob s_job;
++
++int psx_mod_pass_worker_set_job(PSXModPassWorkerJob job) {
++    s_job = job;
++    return 1;
++}
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++static PwShm  *s_shm;
++static HANDLE  s_map, s_ev_job, s_ev_done, s_child;
++static int     s_helper;            /* this process is the helper */
++static int     s_failed;            /* main: helper unusable for the session */
++static int     s_pending;           /* main: a job is out */
++static int     s_have_result;       /* main: the last job's result is kept */
++static long    s_seq;
++static char    s_launch_game[1024], s_launch_disc[1024];
++static char    s_name[96];
++static PSXModPassWorkerStats s_stats;
++
++/* main.cpp: the resolved game config and disc of this session, for the
++ * helper's command line. */
++void pass_worker_note_launch(const char *game, const char *disc) {
++    snprintf(s_launch_game, sizeof s_launch_game, "%s", game ? game : "");
++    snprintf(s_launch_disc, sizeof s_launch_disc, "%s", disc ? disc : "");
++}
++
++static int open_objects(const char *name, int create) {
++    char n[160];
++    snprintf(n, sizeof n, "Local\\%s_shm", name);
++    s_map = create ? CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
++                                        (DWORD)sizeof(PwShm), n)
++                   : OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, n);
++    if (!s_map) return 0;
++    s_shm = (PwShm *)MapViewOfFile(s_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(PwShm));
++    if (!s_shm) return 0;
++    snprintf(n, sizeof n, "Local\\%s_job", name);
++    s_ev_job = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
++    snprintf(n, sizeof n, "Local\\%s_done", name);
++    s_ev_done = create ? CreateEventA(NULL, FALSE, FALSE, n) : OpenEventA(EVENT_ALL_ACCESS, FALSE, n);
++    return s_ev_job && s_ev_done;
++}
++
++int psx_mod_pass_worker_is_helper(void) { return s_helper; }
++
++/* Set (value) or clear (NULL) an environment variable for the child only:
++ * the previous value is kept in old (cap bytes, "" when it was unset). */
++static void env_swap(const char *name, const char *value, char *old, DWORD cap) {
++    DWORD n = GetEnvironmentVariableA(name, old, cap);
++    if (n == 0 || n >= cap) old[0] = '\0';
++    SetEnvironmentVariableA(name, value);
++}
++static void env_restore(const char *name, const char *old) {
++    SetEnvironmentVariableA(name, old[0] ? old : NULL);
++}
++
++int psx_mod_pass_worker_start(void) {
++    if (s_helper || s_failed) return 0;
++    if (s_child) return 1;
++    if (!s_job || psx_ram_live_bytes() != PW_RAM_BYTES || pgxp_value_size() > PW_PGXP_VALUE ||
++        !s_launch_game[0]) {
++        s_failed = 1;
++        return 0;
++    }
++    char exe[MAX_PATH];
++    DWORD el = GetModuleFileNameA(NULL, exe, sizeof exe);
++    if (el == 0 || el >= sizeof exe) { s_failed = 1; return 0; }
++    snprintf(s_name, sizeof s_name, "psxrecomp_pw_%lu", (unsigned long)GetCurrentProcessId());
++    if (!open_objects(s_name, 1)) { s_failed = 1; return 0; }
++    char tmp[MAX_PATH];
++    DWORD tl = GetTempPathA(sizeof tmp, tmp);
++    if (tl == 0 || tl >= sizeof tmp) { s_failed = 1; return 0; }
++    /* One folder for every helper: its memory cards (never written) and its
++     * console output, overwritten per session. */
++    char state_dir[MAX_PATH + 96];
++    snprintf(state_dir, sizeof state_dir, "%spsxrecomp_pass_worker", tmp);
++    CreateDirectoryA(state_dir, NULL);
++    char cmd[4096];
++    snprintf(cmd, sizeof cmd,
++             "\"%s\" --no-launcher --headless --pass-worker %s %lu --memcard-dir \"%s\" "
++             "--game \"%s\"%s%s%s",
++             exe, s_name, (unsigned long)GetCurrentProcessId(), state_dir,
++             s_launch_game, s_launch_disc[0] ? " --disc \"" : "", s_launch_disc,
++             s_launch_disc[0] ? "\"" : "");
++    /* The helper never plays: no audio device, no capture or compile work,
++     * no save-state load, nothing written next to the game. */
++    char captures[MAX_PATH + 160];
++    snprintf(captures, sizeof captures, "%s\\captures.json", state_dir);
++    static char o_audio[256], o_auto[64], o_caps[1024], o_slot[64];
++    env_swap("SDL_AUDIODRIVER", "dummy", o_audio, sizeof o_audio);
++    env_swap("PSX_OVERLAY_AUTOCOMPILE_OFF", "1", o_auto, sizeof o_auto);
++    env_swap("PSX_OVERLAY_CAPTURES", captures, o_caps, sizeof o_caps);
++    env_swap("PSX_LOAD_SLOT", NULL, o_slot, sizeof o_slot);
++    char log_path[MAX_PATH + 160];
++    snprintf(log_path, sizeof log_path, "%s\\helper_log.txt", state_dir);
++    SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
++    HANDLE log = CreateFileA(log_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                             &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    STARTUPINFOA si; PROCESS_INFORMATION pi;
++    memset(&si, 0, sizeof si); si.cb = sizeof si;
++    if (log != INVALID_HANDLE_VALUE) {
++        si.dwFlags = STARTF_USESTDHANDLES;
++        si.hStdOutput = si.hStdError = log;
++        si.hStdInput = NULL;
++    }
++    memset(&pi, 0, sizeof pi);
++    const BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, log != INVALID_HANDLE_VALUE,
++                                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
++    if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
++    env_restore("SDL_AUDIODRIVER", o_audio);
++    env_restore("PSX_OVERLAY_AUTOCOMPILE_OFF", o_auto);
++    env_restore("PSX_OVERLAY_CAPTURES", o_caps);
++    env_restore("PSX_LOAD_SLOT", o_slot);
++    if (!ok) { s_failed = 1; return 0; }
++    CloseHandle(pi.hThread);
++    s_child = pi.hProcess;
++    s_seq = 0;
++    s_pending = 0;
++    s_have_result = 0;
++    return 1;
++}
++
++static int child_alive(void) {
++    if (!s_child) return 0;
++    if (WaitForSingleObject(s_child, 0) == WAIT_TIMEOUT) return 1;
++    if (!s_failed) {
++        DWORD code = 0;
++        GetExitCodeProcess(s_child, &code);
++        fprintf(stderr, "psxrecomp: render pass worker exited (code 0x%lX); "
++                "passes run in-process\n", (unsigned long)code);
++        s_failed = 1;
++    }
++    return 0;
++}
++
++int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user,
++                               uint32_t len) {
++    if (!s_child || s_failed || s_pending || !st || !st->ram || !st->scratchpad ||
++        !st->gpr || !st->gte_data || !st->gte_ctrl || len > PW_USER_BYTES)
++        return 0;
++    if (!child_alive()) { s_failed = 1; return 0; }
++    s_have_result = 0;
++    memcpy(s_shm->ram, st->ram, PW_RAM_BYTES);
++    memcpy(s_shm->spad, st->scratchpad, PW_SPAD_BYTES);
++    s_shm->dirty_n = dirty_ram_get_bitmap_word_count();
++    if (s_shm->dirty_n > PW_DIRTY_WORDS) s_shm->dirty_n = PW_DIRTY_WORDS;
++    for (uint32_t i = 0; i < s_shm->dirty_n; i++) s_shm->dirty[i] = dirty_ram_get_bitmap_word(i);
++    memcpy(s_shm->gpr, st->gpr, sizeof s_shm->gpr);
++    s_shm->hi = st->hi;
++    s_shm->lo = st->lo;
++    memcpy(s_shm->gte_data, st->gte_data, sizeof s_shm->gte_data);
++    memcpy(s_shm->gte_ctrl, st->gte_ctrl, sizeof s_shm->gte_ctrl);
++    s_shm->user_len = len;
++    if (len) memcpy(s_shm->user, user, len);
++    s_shm->ok = 0;
++    MemoryBarrier();
++    s_shm->job_seq = ++s_seq;
++    SetEvent(s_ev_job);
++    s_pending = 1;
++    s_stats.submitted++;
++    return 1;
++}
++
++int psx_mod_pass_worker_pending(void) { return s_pending; }
++
++int psx_mod_pass_worker_result(uint32_t wait_ms) {
++    if (!s_pending) return s_have_result;
++    if (s_shm->done_seq != s_seq) {
++        const DWORD r = WaitForSingleObject(s_ev_done, wait_ms);
++        if (r != WAIT_OBJECT_0 && s_shm->done_seq != s_seq) {
++            if (!child_alive()) { s_failed = 1; s_pending = 0; }
++            s_stats.late++;
++            return 0;
++        }
++    }
++    MemoryBarrier();
++    s_pending = 0;
++    if (!s_shm->ok) { s_stats.failed++; return 0; }
++    s_stats.done++;
++    s_stats.last_job_ms = s_shm->job_ms;
++    s_stats.last_pages = s_shm->npages;
++    s_stats.last_pgxp = s_shm->npgxp;
++    s_have_result = 1;
++    return 1;
++}
++
++int psx_mod_pass_worker_apply(void) {
++    if (!g_psx_render_pass_active || s_helper || !s_shm || !s_have_result) return 0;
++    uint8_t *ram = memory_get_ram_ptr();
++    for (uint32_t i = 0; i < s_shm->npages; i++)
++        memcpy(ram + (size_t)s_shm->page_idx[i] * PW_PAGE, s_shm->pages[i], PW_PAGE);
++    memcpy(memory_get_scratchpad_ptr(), s_shm->spad_out, PW_SPAD_BYTES);
++    pgxp_pass_import(s_shm->pgxp_idx, s_shm->pgxp_val, s_shm->npgxp);
++    return 1;
++}
++
++void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats *out) {
++    if (!out) return;
++    *out = s_stats;
++    out->running = child_alive();
++    out->failed_session = s_failed;
++}
++
++/* ---- helper side ---- */
++static jmp_buf s_jmp;
++static void helper_overrun(void) { longjmp(s_jmp, 1); }
++
++static void helper_job(struct CPUState *cpu) {
++    LARGE_INTEGER t0, t1, f;
++    QueryPerformanceCounter(&t0);
++    uint8_t *ram = memory_get_ram_ptr();
++    /* Load the main process's RAM and its code-tracking bitmap, then
++     * revalidate code as a savestate load does (boot_state.c). */
++    memcpy(ram, s_shm->ram, PW_RAM_BYTES);
++    dirty_ram_set_bitmap_words(s_shm->dirty, s_shm->dirty_n);
++    overlay_watch_invalidate_after_ram_restore();
++    memcpy(memory_get_scratchpad_ptr(), s_shm->spad, PW_SPAD_BYTES);
++    memcpy(cpu->gpr, s_shm->gpr, sizeof s_shm->gpr);
++    cpu->hi = s_shm->hi;
++    cpu->lo = s_shm->lo;
++    memcpy(cpu->gte_data, s_shm->gte_data, sizeof s_shm->gte_data);
++    memcpy(cpu->gte_ctrl, s_shm->gte_ctrl, sizeof s_shm->gte_ctrl);
++    PsxCycleFreeze freeze;
++    int ok = 0;
++    s_shm->npages = 0;
++    s_shm->npgxp = 0;
++    if (psx_cycle_freeze_begin(&freeze, PW_WATCHDOG, helper_overrun)) {
++        gte_precision_checkpoint_begin();
++        if (setjmp(s_jmp) == 0) {
++            ok = s_job ? s_job(cpu, s_shm->user, s_shm->user_len) : 0;
++        } else {
++            /* Runaway job: the host nesting it left is unknown. Report and
++             * exit; the main process falls back to in-process passes. */
++            extern uint32_t g_debug_current_func_addr, g_debug_last_store_pc;
++            fprintf(stderr, "psxrecomp: pass worker job watchdog pc=0x%08X ra=0x%08X "
++                    "function=0x%08X last_store=0x%08X\n", cpu->pc, cpu->gpr[31],
++                    g_debug_current_func_addr, g_debug_last_store_pc);
++            fflush(stderr);
++            s_shm->ok = 0;
++            s_shm->done_seq = s_shm->job_seq;
++            SetEvent(s_ev_done);
++            ExitProcess(3);
++        }
++        uint32_t np = 0;
++        for (uint32_t p = 0; ok && p < PW_PAGES; p++) {
++            if (memcmp(ram + (size_t)p * PW_PAGE, s_shm->ram + (size_t)p * PW_PAGE, PW_PAGE) == 0)
++                continue;
++            if (np == PW_MAX_PAGES) { ok = 0; break; }
++            s_shm->page_idx[np] = (uint16_t)p;
++            memcpy(s_shm->pages[np], ram + (size_t)p * PW_PAGE, PW_PAGE);
++            np++;
++        }
++        s_shm->npages = np;
++        memcpy(s_shm->spad_out, memory_get_scratchpad_ptr(), PW_SPAD_BYTES);
++        if (ok) {
++            const uint32_t n = pgxp_pass_export(s_shm->pgxp_idx, s_shm->pgxp_val, PW_MAX_PGXP);
++            if (n == UINT32_MAX) ok = 0;
++            else s_shm->npgxp = n;
++        }
++        gte_precision_checkpoint_rollback();
++        psx_cycle_freeze_end(&freeze);
++    }
++    QueryPerformanceCounter(&t1);
++    QueryPerformanceFrequency(&f);
++    s_shm->job_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
++    s_shm->ok = ok;
++}
++
++/* main.cpp --pass-worker: serve jobs until the main process exits. */
++int pass_worker_helper_main(struct CPUState *cpu, const char *name, unsigned long parent_pid) {
++    s_helper = 1;
++    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)parent_pid);
++    if (!parent || !open_objects(name, 0) || pgxp_value_size() > PW_PGXP_VALUE) return 2;
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++    for (;;) {
++        HANDLE w[2] = { s_ev_job, parent };
++        const DWORD r = WaitForMultipleObjects(2, w, FALSE, INFINITE);
++        if (r != WAIT_OBJECT_0) return 0;            /* the game exited */
++        const long seq = s_shm->job_seq;
++        MemoryBarrier();
++        helper_job(cpu);
++        MemoryBarrier();
++        s_shm->done_seq = seq;
++        SetEvent(s_ev_done);
++        /* A job runs with guest time frozen, and this machine runs nothing
++         * else: a transfer a job started (a GPU or DMA busy window) would
++         * stay busy for every later job. Let one frame of device time pass,
++         * as the game's own frame would, and drop the interrupts it raised
++         * (no guest code here takes them). */
++        psx_advance_cycles(g_psx_vblank_cycles);
++        i_stat = 0;
++    }
++}
++
++#else  /* !_WIN32 */
++
++void pass_worker_note_launch(const char *game, const char *disc) {
++    (void)game; (void)disc;
++}
++int psx_mod_pass_worker_is_helper(void) { return 0; }
++int psx_mod_pass_worker_start(void) { return 0; }
++int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user,
++                               uint32_t len) {
++    (void)st; (void)user; (void)len; return 0;
++}
++int psx_mod_pass_worker_pending(void) { return 0; }
++int psx_mod_pass_worker_result(uint32_t wait_ms) { (void)wait_ms; return 0; }
++int psx_mod_pass_worker_apply(void) { return 0; }
++void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats *out) {
++    if (out) memset(out, 0, sizeof *out);
++}
++int pass_worker_helper_main(struct CPUState *cpu, const char *name, unsigned long parent_pid) {
++    (void)cpu; (void)name; (void)parent_pid; return 2;
++}
++#endif
+diff --git a/runtime/src/pgxp.cpp b/runtime/src/pgxp.cpp
+index 1a97a6c8..8b44cdbd 100644
+--- a/runtime/src/pgxp.cpp
++++ b/runtime/src/pgxp.cpp
+@@ -474,6 +474,43 @@ extern "C" void pgxp_checkpoint_rollback(void) {
+     }
+ }
+ 
++/* Render-pass helper process (pass_worker.c): the shadows a pass in the
++ * helper wrote, carried to the main process. Export lists every RAM /
++ * scratchpad slot the open checkpoint journaled, as its shadow index and
++ * current value (gen 1 = live there, 0 = dead). Import writes them into this
++ * process's shadows through the journal, so the enclosing pass rolls them back
++ * like shadows its own guest code wrote. Returns UINT32_MAX when the slots do
++ * not fit in cap. */
++extern "C" uint32_t pgxp_value_size(void) { return (uint32_t)sizeof(PGXPValue); }
++
++extern "C" uint32_t pgxp_pass_export(uint32_t *index, void *values, uint32_t cap) {
++    PGXPValue *out = (PGXPValue *)values;
++    if (s_ck_depth == 0 || s_ck_lossy) return UINT32_MAX;
++    if (s_ck_n > cap) return UINT32_MAX;
++    for (size_t i = 0; i < s_ck_n; i++) {
++        const PGXPValue *pv = s_ck_log[i].slot;
++        index[i] = (uint32_t)ck_index(pv);
++        out[i] = *pv;
++        out[i].gen = pv->gen == s_gen ? 1u : 0u;
++    }
++    return (uint32_t)s_ck_n;
++}
++
++extern "C" void pgxp_pass_import(const uint32_t *index, const void *values, uint32_t n) {
++    const PGXPValue *in = (const PGXPValue *)values;
++    if (!s_ram) return;
++    for (uint32_t i = 0; i < n; i++) {
++        PGXPValue *pv;
++        if (index[i] < PGXP_SHADOW_WORDS) pv = &s_ram[index[i]];
++        else if (index[i] - PGXP_SHADOW_WORDS < PGXP_SCRATCH_WORDS)
++            pv = &s_scratch[index[i] - PGXP_SHADOW_WORDS];
++        else continue;
++        ck_note(pv);
++        *pv = in[i];
++        pv->gen = in[i].gen ? s_gen : 0u;
++    }
++}
++
+ PGXP_HOT int pv_live(const PGXPValue *pv) {
+     return pv && pv->gen == s_gen && (pv->flags & PGXP_F_VXY) != 0;
+ }
+diff --git a/runtime/src/render_pass.c b/runtime/src/render_pass.c
+index 84d760df..87e9a943 100644
+--- a/runtime/src/render_pass.c
++++ b/runtime/src/render_pass.c
+@@ -355,6 +355,7 @@ int psx_mod_set_render_pass_flip(uint32_t mode) {
+ /* Transaction kinds: what `eye` holds in render_transaction. */
+ #define RP_EYE_PASS  (-1)   /* temporal pass */
+ #define RP_EYE_LOCAL (-2)   /* netplay local view */
++#define RP_EYE_LATE  (-3)   /* temporal pass into the frame on screen */
+ 
+ /* Everything that must hold before guest code may run frozen, as a
+  * PSX_MOD_RENDER_PASS_* reason (READY = all of it holds). kind: 0 temporal
+@@ -670,7 +671,7 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
+     }
+ 
+     if (!cpu || !pass || !fn || pass->struct_size < sizeof *pass ||
+-        pass->w == 0 || pass->h == 0 || (eye == RP_EYE_PASS &&
++        pass->w == 0 || pass->h == 0 || ((eye == RP_EYE_PASS || eye == RP_EYE_LATE) &&
+         (pass->alpha_q16 == 0 || pass->alpha_q16 >= 65536u))) {
+         s_stats.argument_refused++;
+         return pass_refuse("arguments", transaction_status(transaction_kind(eye)));
+@@ -701,6 +702,8 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
+     /* Frame N's own image is captured by the first pass after a plan. */
+     if (!(eye >= 0 ? gl_renderer_stereo_begin(pass->x, pass->y, pass->w,
+                                                pass->h, reuse)
++          : eye == RP_EYE_LATE ? gl_renderer_pass_begin_late(pass->x, pass->y,
++                                                             pass->w, pass->h)
+           : eye == RP_EYE_LOCAL ? gl_renderer_local_view_begin(pass->x, pass->y,
+                                                                pass->w, pass->h)
+                     : gl_renderer_pass_begin(pass->x, pass->y, pass->w,
+@@ -815,7 +818,7 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
+         s_stats.avg_pass_ms = s_stats.avg_pass_ms > 0.0
+             ? s_stats.avg_pass_ms * 0.9 + ms * 0.1 : ms;
+     }
+-    if (eye == RP_EYE_PASS) gl_renderer_pass_note_cost(t1 - t0);
++    if (eye == RP_EYE_PASS || eye == RP_EYE_LATE) gl_renderer_pass_note_cost(t1 - t0);
+     if (ok && eye == RP_EYE_LOCAL) {
+         s_stats.local_views++;
+         /* The peer's own image supersedes a crop of the canonical frame. */
+@@ -825,7 +828,7 @@ static int render_transaction(struct CPUState *cpu, const PSXModRenderPass *pass
+     else if (s_stats.watchdog_flag) note_fault("guest-cycle watchdog");
+     s_stats.watchdog_flag = 0;
+     /* Present anything that fell due while the pass ran. */
+-    if (eye == RP_EYE_PASS) gl_renderer_pass_service_presents();
++    if (eye == RP_EYE_PASS || eye == RP_EYE_LATE) gl_renderer_pass_service_presents();
+     return ok;
+ }
+ 
+@@ -852,6 +855,24 @@ int psx_mod_render_pass(struct CPUState *cpu, const PSXModRenderPass *pass,
+     return render_transaction(cpu, pass, fn, user, -1);
+ }
+ 
++int psx_mod_render_pass_open(const PSXModRenderPass *rect) {
++    int ok;
++    if (!s_open_generation || !rect || rect->struct_size < sizeof *rect ||
++        rect->w == 0 || rect->h == 0 || !passes_allowed())
++        return 0;
++    ok = gl_renderer_pass_begin(rect->x, rect->y, rect->w, rect->h, 1,
++                                s_plan_period, 0);
++    if (ok) gl_renderer_pass_end(0, 0);
++    s_open_generation = 0;
++    s_restored_valid = 0;
++    return ok;
++}
++
++int psx_mod_render_pass_late(struct CPUState *cpu, const PSXModRenderPass *pass,
++                             PSXModRenderPassFn fn, void *user) {
++    return render_transaction(cpu, pass, fn, user, RP_EYE_LATE);
++}
++
+ typedef struct StereoCallback {
+     PSXModStereoFn fn;
+     void *user;
+diff --git a/runtime/src/render_pass_motion.c b/runtime/src/render_pass_motion.c
+index ea5756af..e53caee4 100644
+--- a/runtime/src/render_pass_motion.c
++++ b/runtime/src/render_pass_motion.c
+@@ -439,6 +439,24 @@ void psx_motion_apply(const PSXMotionSet* s, double t) {
+     }
+ }
+ 
++uint32_t psx_motion_export(const PSXMotionSet* s, double t,
++                           PSXMotionValue* out, uint32_t max) {
++    if (!s || !out || s->npairs > max) return 0;
++    const MotionEntry* pe = s->cap_buf[s->cur ^ 1];
++    const MotionEntry* ce = s->cap_buf[s->cur];
++    for (uint32_t k = 0; k < s->npairs; k++) {
++        const MotionEntry* b = &ce[s->pairs[k].cur];
++        blend_entry(&pe[s->pairs[k].prev], b, t, out[k].v);
++        out[k].kind = b->kind;
++        out[k].addr = b->addr;
++    }
++    return s->npairs;
++}
++
++void psx_motion_write_value(const PSXMotionValue* value) {
++    if (value) write_entry((uint8_t)value->kind, value->addr, value->v);
++}
++
+ static void export_value(uint8_t kind, const int32_t* v, void* out) {
+     if (kind == PSX_MOTION_MATRIX || kind == PSX_MOTION_MATRIX_TRANSLATION ||
+         kind == PSX_MOTION_ROTATION) {
+-- 
+2.55.0.windows.5
+

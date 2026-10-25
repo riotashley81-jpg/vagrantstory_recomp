@@ -85,6 +85,8 @@ target_sources(psx-runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_stick_camera.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_skip_logos.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_exit_menu.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_frame_rate_mod.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_perf.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_glyphs.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_audio_session.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vs_overlay_precompile.c")

@@ -1,0 +1,46 @@
+From 8e9f4d1d59fc33612c68239190786f55cc4b1683 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Fri, 23 Oct 2026 01:21:11 +0200
+Subject: [PATCH] Render passes: binary-search the pair in psx_motion_blend_at
+
+prepare appends pairs in ascending current index; blending one value per
+call (a skeleton's bones, ~700 per pass) searched them linearly.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/render_pass_motion.c | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/render_pass_motion.c b/runtime/src/render_pass_motion.c
+index 7460d830..ea5756af 100644
+--- a/runtime/src/render_pass_motion.c
++++ b/runtime/src/render_pass_motion.c
+@@ -470,13 +470,18 @@ int psx_motion_blend_at(const PSXMotionSet* s, uint32_t kind, uint32_t addr,
+         else hi = mid;
+     }
+     if (lo >= s->n[s->cur] || ce[lo].addr != addr || ce[lo].kind != kind) return -1;
+-    for (uint32_t k = 0; k < s->npairs; k++) {
+-        if (s->pairs[k].cur == lo) {
+-            int32_t v[12];
+-            blend_entry(&s->cap_buf[s->cur ^ 1][s->pairs[k].prev], &ce[lo], t, v);
+-            export_value(ce[lo].kind, v, out);
+-            return 1;
+-        }
++    /* prepare appends pairs in ascending current index: binary search. */
++    uint32_t plo = 0, phi = s->npairs;
++    while (plo < phi) {
++        const uint32_t mid = (plo + phi) / 2;
++        if (s->pairs[mid].cur < lo) plo = mid + 1;
++        else phi = mid;
++    }
++    if (plo < s->npairs && s->pairs[plo].cur == lo) {
++        int32_t v[12];
++        blend_entry(&s->cap_buf[s->cur ^ 1][s->pairs[plo].prev], &ce[lo], t, v);
++        export_value(ce[lo].kind, v, out);
++        return 1;
+     }
+     export_value(ce[lo].kind, ce[lo].v, out);
+     return 0;
+-- 
+2.55.0.windows.5
+

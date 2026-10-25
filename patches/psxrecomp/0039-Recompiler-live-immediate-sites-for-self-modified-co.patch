@@ -1,0 +1,174 @@
+From 13598f49720c9488387d0069647791bb7c5c3515 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 22 Oct 2026 23:53:54 +0200
+Subject: [PATCH] Recompiler: live immediate sites for self-modified compares
+
+[recompiler] live_immediate_sites lists SLTI/SLTIU words whose immediate
+the game rewrites at run time. They are emitted to read the immediate from
+RAM, and (where the word is such a compare) left out of the function's
+code-validity ranges, so one compiled body serves every value. Before,
+each new value was a different code identity: Vagrant Story's map renderer
+rewrites four clip compares as the camera tilts, so looking up fell back to
+the interpreter (about 20 fps in the field and cutscenes).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ recompiler/include/code_generator.h |  5 +++++
+ recompiler/src/code_generator.cpp   | 30 +++++++++++++++++++++++++++++
+ recompiler/src/config_loader.cpp    | 11 +++++++++++
+ recompiler/src/config_loader.h      |  2 ++
+ recompiler/src/main_psx.cpp         |  4 ++++
+ 5 files changed, 52 insertions(+)
+
+diff --git a/recompiler/include/code_generator.h b/recompiler/include/code_generator.h
+index bfb40bda..7776db5e 100644
+--- a/recompiler/include/code_generator.h
++++ b/recompiler/include/code_generator.h
+@@ -67,6 +67,11 @@ struct CodeGenConfig {
+     // Only explicitly listed guest functions call the runtime dispatcher.
+     std::set<uint32_t> mod_function_entry_funcs;
+     std::set<uint32_t> mod_instruction_sites;
++    // [recompiler] live_immediate_sites: SLTI/SLTIU words whose immediate the
++    // game rewrites at run time (self-modified clip limits). Emitted to read
++    // the immediate from RAM, and left out of the code-validity ranges, so one
++    // compiled body serves every value instead of each value being new code.
++    std::set<uint32_t> live_immediate_sites;
+ 
+     // [recompiler] hot_funcs: emit __attribute__((hot)) on these guest
+     // addresses (MotK VLC leaves, etc.). Host locality hint only.
+diff --git a/recompiler/src/code_generator.cpp b/recompiler/src/code_generator.cpp
+index 9e280940..a6062a2f 100644
+--- a/recompiler/src/code_generator.cpp
++++ b/recompiler/src/code_generator.cpp
+@@ -1494,6 +1494,20 @@ std::string CodeGenerator::translate_instruction_core(uint32_t addr, uint32_t in
+                                reg_name(rt), reg_name(rs), (int)uimm, comment);
+         }
+     }
++    // Live immediate ([recompiler] live_immediate_sites): the game rewrites
++    // this compare's immediate at run time; read it from RAM (the low half of
++    // the instruction word) instead of baking the captured value. The word is
++    // left out of the validity ranges (generate_ranges_manifest).
++    if (config_.live_immediate_sites.count(addr) && (opcode == 0x0A || opcode == 0x0B)) {
++        uint32_t rs = get_rs(instr), rt = get_rt(instr);
++        if (rt == 0) return "/* nop: write to $zero */" + comment;
++        return fmt::format("{{ const int32_t _li = (int16_t)cpu->read_half(0x{:08X}u); "
++                           "{} = ({} < {}) ? 1 : 0; }}  /* live immediate */{}",
++                           addr, reg_name(rt),
++                           opcode == 0x0A ? "(int32_t)" + reg_name(rs) : reg_name(rs),
++                           opcode == 0x0A ? std::string("_li") : std::string("(uint32_t)_li"),
++                           comment);
++    }
+     // Explicit signed lower-bound widen (`slti rt, sx, -W`). Unlike the
+     // min/max right-edge helper below, this moves the immediate left by one
+     // live reveal margin. The helper sign-extends the 16-bit immediate.
+@@ -4058,6 +4072,22 @@ std::string CodeGenerator::generate_ranges_manifest(
+             if (hi > lo) iv.emplace_back(lo, hi);
+         }
+         if (iv.empty()) continue;
++        // Live immediate words are rewritten by the game at run time; the
++        // emitted code reads them, so they are not part of the code identity.
++        for (uint32_t w : config_.live_immediate_sites) {
++            /* Only where the word IS a compare the emitter made live; other
++             * code at the same address keeps it in its identity. */
++            const auto word = exe_.read_word(w);
++            if (!word || ((*word >> 26) != 0x0Au && (*word >> 26) != 0x0Bu)) continue;
++            std::vector<std::pair<uint32_t, uint32_t>> cut;
++            for (const auto& r : iv) {
++                if (w + 4u <= r.first || w >= r.second) { cut.push_back(r); continue; }
++                if (w > r.first) cut.emplace_back(r.first, w);
++                if (w + 4u < r.second) cut.emplace_back(w + 4u, r.second);
++            }
++            iv.swap(cut);
++        }
++        if (iv.empty()) continue;
+ 
+         // Merge overlapping/adjacent intervals. A gap > 0 between blocks is
+         // non-code (e.g. a jump table) and is intentionally left out.
+diff --git a/recompiler/src/config_loader.cpp b/recompiler/src/config_loader.cpp
+index 85fcf467..371ed3d0 100644
+--- a/recompiler/src/config_loader.cpp
++++ b/recompiler/src/config_loader.cpp
+@@ -81,6 +81,8 @@ uint32_t overlay_codegen_config_hash(const GameConfig& c) {
+     // does not use the feature keeps the hash (and every overlay cache) it had.
+     if (!c.mod_instruction_sites.empty())
+         h.words("mod_instruction_sites", c.mod_instruction_sites);
++    if (!c.live_immediate_sites.empty())
++        h.words("live_immediate_sites", c.live_immediate_sites);
+     h.words("cull_bias", c.ws_cull_bias_sites);
+     if (!c.ws_cull_bias_lower_sites.empty())
+         h.words("cull_bias_lower", c.ws_cull_bias_lower_sites);
+@@ -1888,6 +1890,14 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+                 throw std::runtime_error("mod instruction site must be aligned main RAM");
+             mod_instruction_sites.push_back(pc);
+         }
++    std::vector<uint32_t> live_immediate_sites;
++    if (recomp.contains("live_immediate_sites"))
++        for (const auto& a : toml::find<std::vector<std::string>>(recomp, "live_immediate_sites")) {
++            const auto pc = parse_hex(a, "recompiler.live_immediate_sites");
++            if ((pc & 3u) || pc >= 0xC0000000u || (pc & 0x1FFFFFFFu) >= 0x00800000u)
++                throw std::runtime_error("live immediate site must be aligned main RAM");
++            live_immediate_sites.push_back(pc);
++        }
+     std::vector<uint32_t> mod_function_entry_funcs;
+     if (recomp.contains("mod_function_entry_funcs")) {
+         const auto& arr = toml::find<std::vector<std::string>>(
+@@ -2662,6 +2672,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
+         /*data_shard_funcs*/      data_shard_funcs,
+         /*mod_function_entry_funcs*/ mod_function_entry_funcs,
+         /*mod_instruction_sites*/ mod_instruction_sites,
++        /*live_immediate_sites*/  live_immediate_sites,
+         /*hot_funcs*/             hot_funcs,
+         /*load_charge_batch*/     load_charge_batch,
+         /*load_charge_batch_funcs*/ load_charge_batch_funcs,
+diff --git a/recompiler/src/config_loader.h b/recompiler/src/config_loader.h
+index 4e3461c1..601b2134 100644
+--- a/recompiler/src/config_loader.h
++++ b/recompiler/src/config_loader.h
+@@ -1083,6 +1083,8 @@ struct GameConfig {
+     std::vector<uint32_t> mod_function_entry_funcs;
+     // Opt-in pre-instruction callbacks; plugins supply exact-word guards.
+     std::vector<uint32_t> mod_instruction_sites;
++    // [recompiler] live_immediate_sites (code_generator.h).
++    std::vector<uint32_t> live_immediate_sites;
+ 
+     // [recompiler] hot_funcs: guest addresses that get __attribute__((hot))
+     // on their generated C bodies (profile/host locality; no guest semantics).
+diff --git a/recompiler/src/main_psx.cpp b/recompiler/src/main_psx.cpp
+index d341770d..1710ba7e 100644
+--- a/recompiler/src/main_psx.cpp
++++ b/recompiler/src/main_psx.cpp
+@@ -220,6 +220,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
+     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
+     std::set<uint32_t>    ds_funcs;             // [data_shards] funcs
+     std::set<uint32_t>    mod_instruction_sites;
++    std::set<uint32_t>    live_immediate_sites;
+     std::set<uint32_t>    mod_entry_funcs;      // trusted game-mod entry hooks
+     std::vector<PSXRecompV4::WidescreenMaskedRejectSite> ws_cull_masked_reject;
+     std::set<uint32_t>    hot_funcs;            // [recompiler] hot_funcs
+@@ -289,6 +290,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
+         mod_entry_funcs.insert(cfg.mod_function_entry_funcs.begin(),
+                                cfg.mod_function_entry_funcs.end());
+         mod_instruction_sites.insert(cfg.mod_instruction_sites.begin(), cfg.mod_instruction_sites.end());
++        live_immediate_sites.insert(cfg.live_immediate_sites.begin(), cfg.live_immediate_sites.end());
+         hot_funcs.insert(cfg.hot_funcs.begin(), cfg.hot_funcs.end());
+         if (cfg.load_charge_batch) {
+             load_charge_batch_funcs.insert(cfg.load_charge_batch_funcs.begin(),
+@@ -407,6 +409,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
+         mod_entry_funcs.insert(wscfg.mod_function_entry_funcs.begin(),
+                                wscfg.mod_function_entry_funcs.end());
+         mod_instruction_sites.insert(wscfg.mod_instruction_sites.begin(), wscfg.mod_instruction_sites.end());
++        live_immediate_sites.insert(wscfg.live_immediate_sites.begin(), wscfg.live_immediate_sites.end());
+         ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
+         ws_cull_bias_lower.insert(wscfg.ws_cull_bias_lower_sites.begin(), wscfg.ws_cull_bias_lower_sites.end());
+         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
+@@ -1474,6 +1477,7 @@ static int psxrecomp_game_main(int argc, char** argv) {
+     codegen_config.mod_function_entry_funcs = mod_entry_funcs;
+     codegen_config.ws_cull_masked_reject_sites = ws_cull_masked_reject;
+     codegen_config.mod_instruction_sites = mod_instruction_sites;
++    codegen_config.live_immediate_sites = live_immediate_sites;
+     codegen_config.hot_funcs = hot_funcs;
+     codegen_config.load_charge_batch_funcs = load_charge_batch_funcs;
+     codegen_config.vsync_query_hle_funcs = vsync_query_hle_funcs;
+-- 
+2.55.0.windows.5
+

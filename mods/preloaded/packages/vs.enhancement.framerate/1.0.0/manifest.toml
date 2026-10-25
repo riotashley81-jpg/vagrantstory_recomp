@@ -1,0 +1,37 @@
+format_version = 5
+id = "vs.enhancement.framerate"
+version = "1.0.0"
+name = "60 FPS (engine)"
+author = "VagrantStoryRecomp"
+description = "Experimental. Draws real in-between frames with the game's own code, with the camera and characters placed between the game's 30 fps ticks. Turn Smooth motion off while using it."
+resolver = "declarative"
+save_compatibility = "shared"
+
+[[target]]
+game_id = "SLUS-01040"
+
+[[feature]]
+id = "framerate"
+name = "60 FPS (engine)"
+description = "Experimental engine-level in-between frames in the field, battles and cutscenes."
+group = "Visual"
+default_enabled = false
+
+[[option]]
+feature = "framerate"
+id = "rate"
+label = "Frame rate"
+type = "choice"
+default = "60"
+
+[[option.choice]]
+value = "60"
+label = "60 fps"
+
+[[option.choice]]
+value = "display"
+label = "Display refresh"
+
+[[plugin]]
+feature = "framerate"
+id = "vs.framerate"

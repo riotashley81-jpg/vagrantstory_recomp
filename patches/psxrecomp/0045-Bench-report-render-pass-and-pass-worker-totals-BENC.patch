@@ -1,0 +1,39 @@
+From 5035c8a987543876b340d092c3e4f076af246096 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 19:00:50 +0200
+Subject: [PATCH] Bench: report render pass and pass worker totals
+ ([BENCH_PASSES])
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/main.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/runtime/src/main.cpp b/runtime/src/main.cpp
+index c2f71379..d30b598c 100644
+--- a/runtime/src/main.cpp
++++ b/runtime/src/main.cpp
+@@ -4414,6 +4414,20 @@ static void runtime_perf_bench_tick(uint64_t now) {
+         end.capture_triggers - start.capture_triggers,
+         end.capture_overlays - start.capture_overlays,
+         (unsigned long long)end.capture_last_dispatch_delta);
++    {
++        /* Session totals: render passes and the pass worker (pass_worker.c). */
++        RenderPassStats rp;
++        PSXModPassWorkerStats pw;
++        render_pass_get_stats(&rp);
++        psx_mod_pass_worker_get_stats(&pw);
++        std::fprintf(stdout,
++            "[BENCH_PASSES] plans=%llu passes=%llu worker_submitted=%llu worker_done=%llu "
++            "worker_late=%llu worker_failed=%llu worker_job_ms=%.2f worker_running=%d\n",
++            (unsigned long long)rp.plans, (unsigned long long)rp.passes,
++            (unsigned long long)pw.submitted, (unsigned long long)pw.done,
++            (unsigned long long)pw.late, (unsigned long long)pw.failed,
++            pw.last_job_ms, pw.running);
++    }
+     std::fflush(stdout);
+     g_runtime_perf.bench_reported = true;
+ }
+-- 
+2.55.0.windows.5
+

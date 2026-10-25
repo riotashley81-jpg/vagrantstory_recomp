@@ -1,0 +1,76 @@
+From 7c54d187dfee65ca2de99bdda67a22c69c221b46 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 13:22:52 +0200
+Subject: [PATCH] Pass worker: ready handshake; no waits while the helper
+ starts
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/mod_plugins.h | 2 ++
+ runtime/src/pass_worker.c     | 9 +++++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index 5ef37aac..49eed983 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -828,6 +828,8 @@ int psx_mod_pass_worker_submit(const PSXModPassWorkerState* state,
+ /* 1 when the job is done and its result kept, waiting up to wait_ms. */
+ int psx_mod_pass_worker_result(uint32_t wait_ms);
+ int psx_mod_pass_worker_pending(void);
++/* The helper has started and serves jobs (it takes a moment after start). */
++int psx_mod_pass_worker_ready(void);
+ int psx_mod_pass_worker_apply(void);
+ void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats* out);
+ /*
+diff --git a/runtime/src/pass_worker.c b/runtime/src/pass_worker.c
+index 2798ab04..13690889 100644
+--- a/runtime/src/pass_worker.c
++++ b/runtime/src/pass_worker.c
+@@ -55,6 +55,7 @@ extern void     gte_precision_checkpoint_rollback(void);
+ 
+ typedef struct PwShm {
+     volatile long job_seq, done_seq;
++    volatile long ready;          /* the helper is serving jobs */
+     int32_t  ok;
+     uint32_t gpr[32], hi, lo, gte_data[32], gte_ctrl[32];
+     uint32_t user_len;
+@@ -216,6 +217,7 @@ int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user
+         !st->gpr || !st->gte_data || !st->gte_ctrl || len > PW_USER_BYTES)
+         return 0;
+     if (!child_alive()) { s_failed = 1; return 0; }
++    if (!s_shm->ready) return 0;   /* still starting */
+     s_have_result = 0;
+     memcpy(s_shm->ram, st->ram, PW_RAM_BYTES);
+     memcpy(s_shm->spad, st->scratchpad, PW_SPAD_BYTES);
+@@ -240,6 +242,10 @@ int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user
+ 
+ int psx_mod_pass_worker_pending(void) { return s_pending; }
+ 
++int psx_mod_pass_worker_ready(void) {
++    return s_child && !s_failed && s_shm && s_shm->ready && child_alive();
++}
++
+ int psx_mod_pass_worker_result(uint32_t wait_ms) {
+     if (!s_pending) return s_have_result;
+     if (s_shm->done_seq != s_seq) {
+@@ -349,6 +355,8 @@ int pass_worker_helper_main(struct CPUState *cpu, const char *name, unsigned lon
+     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)parent_pid);
+     if (!parent || !open_objects(name, 0) || pgxp_value_size() > PW_PGXP_VALUE) return 2;
+     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++    MemoryBarrier();
++    s_shm->ready = 1;
+     for (;;) {
+         HANDLE w[2] = { s_ev_job, parent };
+         const DWORD r = WaitForMultipleObjects(2, w, FALSE, INFINITE);
+@@ -381,6 +389,7 @@ int psx_mod_pass_worker_submit(const PSXModPassWorkerState *st, const void *user
+     (void)st; (void)user; (void)len; return 0;
+ }
+ int psx_mod_pass_worker_pending(void) { return 0; }
++int psx_mod_pass_worker_ready(void) { return 0; }
+ int psx_mod_pass_worker_result(uint32_t wait_ms) { (void)wait_ms; return 0; }
+ int psx_mod_pass_worker_apply(void) { return 0; }
+ void psx_mod_pass_worker_get_stats(PSXModPassWorkerStats *out) {
+-- 
+2.55.0.windows.5
+

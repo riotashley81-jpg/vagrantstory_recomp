@@ -37,9 +37,15 @@ strict = true
 # title screen's Exit Game entry, src/vs_exit_menu.c).
 mod_instruction_sites = ["0x8006F6EC",
   "0x8006FC3C", "0x8007156C", "0x8007163C", "0x80071640",
-  "0x80071684", "0x800716C4", "0x80070EBC", "0x80071144"]
-# Function filters (src/vs_exit_menu.c: the in-game menu list, BATTLE.PRG).
-mod_function_entry_funcs = ["0x800C930C"]
+  "0x80071684", "0x800716C4", "0x80070EBC", "0x80071144",
+  # src/vs_frame_rate_mod.c: BATTLE.PRG scene draw start and swap call.
+  "0x8007A5F4", "0x8007A794"]
+# Function filters (src/vs_exit_menu.c: the in-game menu list, BATTLE.PRG;
+# src/vs_frame_rate_mod.c: actor draw and its culling check, bones computed).
+mod_function_entry_funcs = ["0x800C930C", "0x800B28A8", "0x800B3A68"]
+# BATTLE.PRG map renderer: the game rewrites these clip compares as the
+# camera tilts; compiled to read the immediate live (one body for every value).
+live_immediate_sites = ["0x80097590", "0x800978F8", "0x800980FC", "0x80098114"]
 
 [runtime]
 window_title = "VagrantStory Recompiled"

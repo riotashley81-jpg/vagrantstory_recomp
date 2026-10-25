@@ -1,0 +1,42 @@
+From 24e270032b8ce2c6c2549a53921ade6716807679 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Thu, 22 Oct 2026 19:42:49 +0200
+Subject: [PATCH] Render passes: capture the presented columns of a guarded
+ native-wide band
+
+With the native-wide guard band (gl_renderer_set_wide_guard) the presenter
+captures only the visible columns; a pass captured the whole surface and
+was refused as capture_size. Request and copy the same columns.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index 3dff29d3..cf67b2ba 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -8257,8 +8257,8 @@ static void pass_capture_into(GLuint tex, const PassGen *g) {
+         }
+         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, wf);
+         glBindTexture(GL_TEXTURE_2D, tex);
+-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, g->y * S,
+-                            g_wide_w * S, g->h * S);
++        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, wide_vis_x() * S, g->y * S,
++                            wide_vis_w() * S, g->h * S);   /* guard band cropped */
+     } else {
+         p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+         glBindTexture(GL_TEXTURE_2D, tex);
+@@ -8432,7 +8432,7 @@ static int transaction_begin(int x, int y, int w, int h, int open_gen,
+         if (cx < x || cy < y || cx + cw > x + w || cy + ch > y + h)
+             return pass_begin_refuse("present_crop");
+     }
+-    tw = (wide ? g_wide_w : cw) * S;
++    tw = (wide ? wide_vis_w() : cw) * S;   /* the presented columns */
+     th = ch * S;
+     s_pass_begin_diag.wide = wide;
+     s_pass_begin_diag.requested_w = tw;
+-- 
+2.55.0.windows.5
+

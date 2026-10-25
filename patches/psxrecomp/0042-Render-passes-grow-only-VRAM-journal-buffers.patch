@@ -1,0 +1,64 @@
+From 7553bf4e8ce4fbddc3e638538bc7617e25daca37 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 12:44:00 +0200
+Subject: [PATCH] Render passes: grow-only VRAM journal buffers
+
+A journaled copy rect of a new size remade the entry's texture, stencil
+buffer and framebuffer on every pass; in Vagrant Story that was about half
+of each pass's cost. Entries now only grow (min 256x256).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/src/gpu_gl_renderer.c | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/src/gpu_gl_renderer.c b/runtime/src/gpu_gl_renderer.c
+index cf67b2ba..27c939d5 100644
+--- a/runtime/src/gpu_gl_renderer.c
++++ b/runtime/src/gpu_gl_renderer.c
+@@ -8300,6 +8300,8 @@ static void pass_verify_read(uint8_t **hr, size_t *hr_cap, uint8_t **raw,
+ 
+ /* VRAM journal for out-of-rect writes during a pass (see pass_refuse_write). */
+ #define PASS_JOURNAL_MAX RENDER_PASS_JOURNAL_MAX
++#define PASS_JOURNAL_MIN_W 256
++#define PASS_JOURNAL_MIN_H 256
+ typedef struct PassJournal {
+     GLuint hr_tex, hr_rb, hr_fbo, raw_tex, raw_fbo;
+     int hr_w, hr_h, raw_w, raw_h;
+@@ -8352,13 +8354,26 @@ static int pass_journal_protect(int x, int y, int w, int h) {
+     PassJournal *j;
+     if (i >= PASS_JOURNAL_MAX) return 0;
+     j = &s_pj[i];
+-    if (!pass_make_color_fbo(&j->hr_tex, &j->hr_rb, &j->hr_fbo, &j->hr_w,
+-                             &j->hr_h, w * S, h * S, GL_RGBA8, GL_RGBA,
+-                             GL_UNSIGNED_BYTE) ||
+-        !pass_make_color_fbo(&j->raw_tex, NULL, &j->raw_fbo, &j->raw_w,
+-                             &j->raw_h, w, h, PSXGL_R16UI, PSXGL_RED_INTEGER,
+-                             GL_UNSIGNED_SHORT))
+-        return 0;
++    /* Entries only grow: the rect is blitted at the entry's origin, so a
++     * larger one serves. Remaking them per size made a GL texture, stencil
++     * buffer and framebuffer per journaled copy, every pass. */
++    {
++        int jw = w > j->raw_w ? w : j->raw_w, jh = h > j->raw_h ? h : j->raw_h;
++        if (jw < PASS_JOURNAL_MIN_W) jw = PASS_JOURNAL_MIN_W;
++        if (jh < PASS_JOURNAL_MIN_H) jh = PASS_JOURNAL_MIN_H;
++        if (jw > VRAM_W) jw = VRAM_W;
++        if (jh > VRAM_H) jh = VRAM_H;
++        if (!j->hr_fbo || j->hr_w != jw * S || j->hr_h != jh * S || !j->raw_fbo ||
++            w > j->raw_w || h > j->raw_h) {
++            if (!pass_make_color_fbo(&j->hr_tex, &j->hr_rb, &j->hr_fbo, &j->hr_w,
++                                     &j->hr_h, jw * S, jh * S, GL_RGBA8, GL_RGBA,
++                                     GL_UNSIGNED_BYTE) ||
++                !pass_make_color_fbo(&j->raw_tex, NULL, &j->raw_fbo, &j->raw_w,
++                                     &j->raw_h, jw, jh, PSXGL_R16UI, PSXGL_RED_INTEGER,
++                                     GL_UNSIGNED_SHORT))
++                return 0;
++        }
++    }
+     flush_flat_batch();
+     flush_tex_batch();
+     flush_cpu_upload();
+-- 
+2.55.0.windows.5
+

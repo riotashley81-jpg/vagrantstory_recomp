@@ -62,6 +62,13 @@ launcher's Mods page:
   sub-pixel position and textures are drawn with perspective. The runtime is
   built with the PGXP hooks (`VS_PGXP_HOOKS`, on), and with the mod's
   CPU-mode option (also on) it reaches about 99% of the game's vertices.
+- **60 FPS (engine)** (experimental, off by default, `src/vs_frame_rate_mod.c`):
+  real in-between frames drawn with the game's own code through psxrecomp's
+  render passes, with the camera and characters placed between the 30 fps
+  game frames, presented in step with the display's refresh. "Display
+  refresh" draws more than one per frame (120 fps on a 120 Hz screen) and
+  needs a fast PC. Event scenes keep their 30 fps frames for now. Notes in
+  `docs/ENGINE_FRAME_RATE.md`.
 
 Higher internal resolution, Smooth motion (frame generation) and the render
 thread come from psxrecomp and are set in the launcher's Display settings.
@@ -71,7 +78,7 @@ thread come from psxrecomp and are set in the launcher's Display settings.
 | Path | What it is |
 |---|---|
 | `game.toml` | Title config for the recompiler and runtime |
-| `src/` | This port's runtime plugins (widescreen, prompts, stick camera, logo skip, exit options) |
+| `src/` | This port's runtime plugins (widescreen, prompts, stick camera, logo skip, exit options, 60 FPS) |
 | `mods/` | The mod packages that expose those features in the launcher |
 | `patches/psxrecomp`, `patches/recomp-ui` | Changes to the two framework submodules |
 | `scripts/apply_patches.*` | Applies those patches on a local branch |

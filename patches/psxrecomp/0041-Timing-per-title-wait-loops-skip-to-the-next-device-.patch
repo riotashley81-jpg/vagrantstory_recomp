@@ -1,0 +1,113 @@
+From 678214a31c28b1879cd0cde0a178d7def082d881 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sat, 24 Oct 2026 12:44:00 +0200
+Subject: [PATCH] Timing: per-title wait loops skip to the next device event
+
+psx_mod_add_wait_loop(pc) names a game's own wait-for-VBlank loop that the
+generic idle detector cannot prove (PsyQ v_wait's stack timeout). At its
+back-edge interrupt check, with nothing pending, guest time advances to the
+next observable device event instead of emulating each iteration.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/mod_plugins.h |  9 +++++++
+ runtime/src/interrupts.c      |  7 ++++++
+ runtime/src/psx_cycles.c      | 44 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/runtime/include/mod_plugins.h b/runtime/include/mod_plugins.h
+index a7af4a05..4b1148a1 100644
+--- a/runtime/include/mod_plugins.h
++++ b/runtime/include/mod_plugins.h
+@@ -774,6 +774,15 @@ uint32_t psx_mod_render_pass_frame(struct CPUState* cpu,
+  */
+ int psx_mod_run_guest_span(struct CPUState* cpu, uint32_t start_pc,
+                            uint32_t stop_pc);
++/*
++ * Declare the back-edge PC of the game's own wait-for-VBlank loop (the resume
++ * PC its interrupt check reports at the top of each iteration). There, with
++ * nothing pending, guest time advances to the next observable device event
++ * instead of emulating each polling iteration (psx_cycles.c). For loops the
++ * generic idle detector cannot prove, e.g. PsyQ v_wait's stack timeout.
++ * Returns 0 when the table is full or the PC is invalid.
++ */
++int psx_mod_add_wait_loop(uint32_t loop_pc);
+ int psx_mod_set_auto_skip_fmv(int enabled);
+ /*
+  * Draw still artwork behind the game image in OpenGL letterbox/pillarbox
+diff --git a/runtime/src/interrupts.c b/runtime/src/interrupts.c
+index 9e2b00e4..6ab35f2c 100644
+--- a/runtime/src/interrupts.c
++++ b/runtime/src/interrupts.c
+@@ -1254,6 +1254,13 @@ void psx_check_interrupts(CPUState* cpu) {
+     uint32_t sw_pending = cpu->cop0[COP0_CAUSE] & cpu->cop0[COP0_SR] & 0x0300u;
+     if (!in_exception && (i_stat & i_mask) == 0 && sw_pending == 0 &&
+         !s_defer_switch_pending) {
++        {
++            extern int g_wait_loop_count;
++            extern void psx_wait_loop_note(CPUState *cpu, uint32_t check_pc);
++            if (g_wait_loop_count)
++                psx_wait_loop_note(cpu, g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
++                                                               : s_compiled_interrupt_resume_pc);
++        }
+         if (g_idle_skip_enabled > 0) {
+             uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                        : s_compiled_interrupt_resume_pc;
+diff --git a/runtime/src/psx_cycles.c b/runtime/src/psx_cycles.c
+index e01e949c..93bfe101 100644
+--- a/runtime/src/psx_cycles.c
++++ b/runtime/src/psx_cycles.c
+@@ -335,6 +335,50 @@ static uint32_t devices_cycles_to_next_idle_event(void) {
+     return best;
+ }
+ 
++/* Configured wait loops (psx_mod_add_wait_loop, mod_plugins.h): a game's own
++ * "wait for the next VBlank" loop that the generic idle detector cannot prove
++ * (PsyQ v_wait counts a timeout down in a stack slot, a store every
++ * iteration). At the loop's back-edge interrupt check, with nothing pending,
++ * guest time advances straight to the next observable device event instead of
++ * the host emulating every polling iteration; the event is then delivered at
++ * that same check, exactly as the polling loop would have seen it. The only
++ * guest-visible difference is the skipped timeout decrements, which can only
++ * move a timeout later. Off in netplay, self-check, frozen time, exceptions
++ * and lockstep. */
++#define WAIT_LOOP_MAX 8
++static uint32_t s_wait_loop_pcs[WAIT_LOOP_MAX];
++int      g_wait_loop_count = 0;
++uint64_t g_wait_loop_skips = 0, g_wait_loop_cycles = 0;
++
++int psx_mod_add_wait_loop(uint32_t loop_pc) {
++    if (loop_pc == 0u || (loop_pc & 3u) || g_wait_loop_count >= WAIT_LOOP_MAX) return 0;
++    for (int i = 0; i < g_wait_loop_count; i++)
++        if (s_wait_loop_pcs[i] == (loop_pc & 0x1FFFFFFFu)) return 1;
++    s_wait_loop_pcs[g_wait_loop_count++] = loop_pc & 0x1FFFFFFFu;
++    return 1;
++}
++
++void psx_wait_loop_note(CPUState *cpu, uint32_t check_pc) {
++    extern int g_psx_call_bail, g_precise_mode, g_ls_mode, g_ls_replay_active;
++    extern int psx_get_in_exception(void);
++    extern int psx_netplay_active(void);
++    extern int psx_selfcheck_enabled(void);
++    int hit = 0;
++    (void)cpu;
++    for (int i = 0; i < g_wait_loop_count; i++)
++        if (s_wait_loop_pcs[i] == (check_pc & 0x1FFFFFFFu)) { hit = 1; break; }
++    if (!hit || g_psx_guest_time_frozen || g_ls_replay_active || g_ls_mode != 0 ||
++        g_precise_mode || g_psx_call_bail || psx_get_in_exception() ||
++        psx_netplay_active() || psx_selfcheck_enabled())
++        return;
++    uint32_t dist = devices_cycles_to_next_idle_event();
++    if (dist <= 64u) return;                       /* a few iterations get there */
++    if (dist > 1200000u) dist = 1200000u;          /* as IDLE_SKIP_MAX_CYCLES */
++    g_wait_loop_skips++;
++    g_wait_loop_cycles += dist;
++    psx_advance_cycles(dist);   /* replays device events exactly */
++}
++
+ /* Test/diagnostic accessor for the idle-skip observation boundary above. */
+ uint32_t psx_idle_cycles_to_next_observable_event(void) {
+     return devices_cycles_to_next_idle_event();
+-- 
+2.55.0.windows.5
+
