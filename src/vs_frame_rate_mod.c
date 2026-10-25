@@ -492,6 +492,37 @@ static int fr_worker_frame(const PSXModRenderPassFrame* frame, uint32_t draw_env
     return 1;
 }
 
+/* vs_scratch.camera.angles are 12-bit angles in s32s (4096 per turn) that
+ * wrap: turning the camera past 0 goes 0 -> 4088. Tracked as plain
+ * vectors, that blended the long way round, half a turn off (an in-between
+ * frame facing away: the screen mostly black, the minimap turned; reported
+ * at a wall in the field). Blend them along the shorter arc instead, from
+ * the two ticks' draw-start values. */
+static void fr_fix_angle_blends(FrBlendSet* bs) {
+    const FrKept* a = fr_kept(bs->tick - 1u);
+    const FrKept* c = fr_kept(bs->tick);
+    const uint32_t off = VS_CAM_ANGLES - 0x1F800000u;
+    if (!a || !c) return;
+    for (uint32_t b = 0; b < FR_BLENDS; b++) {
+        const double t = (b + 1) / 4.0;
+        for (uint32_t i = 0; i < bs->n[b]; i++) {
+            PSXMotionValue* v = &bs->v[b][i];
+            if (v->addr != VS_CAM_ANGLES || v->kind != PSX_MOTION_VECTOR) continue;
+            for (uint32_t k = 0; k < 3; k++) {
+                int32_t p, q;
+                memcpy(&p, a->spad + off + 4u * k, 4);
+                memcpy(&q, c->spad + off + 4u * k, 4);
+                int32_t d = q - p;
+                if (d > 2048) d -= 4096;
+                else if (d < -2048) d += 4096;
+                int32_t r = p + (int32_t)(t * d + (d >= 0 ? 0.5 : -0.5));
+                if (p >= 0 && p < 4096 && q >= 0 && q < 4096) r &= 4095;
+                v->v[k] = r;
+            }
+        }
+    }
+}
+
 static void fr_swap_call(struct CPUState* cpu, uint32_t address) {
     (void)address;
     if (g_psx_render_pass_active || !fr_kept(s_fr.tick)) return;
@@ -509,6 +540,7 @@ static void fr_swap_call(struct CPUState* cpu, uint32_t address) {
         for (uint32_t b = 0; b < FR_BLENDS; b++)
             bs->n[b] = psx_motion_export(s_fr.motion, (b + 1) / 4.0, bs->v[b], FR_MAX_VALUES);
         bs->tick = s_fr.tick;
+        fr_fix_angle_blends(bs);
         bs->valid = 1;
     }
     /* The buffer the presenter will see as new next: the display's, when
