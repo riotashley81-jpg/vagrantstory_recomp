@@ -1,0 +1,114 @@
+From e47cf18f7addc62a4c773ae05a72da6d68869115 Mon Sep 17 00:00:00 2001
+From: riotashley81-jpg <riotashley81@gmail.com>
+Date: Sun, 25 Oct 2026 11:13:16 +0100
+Subject: [PATCH] Pass worker: run jobs with the game's widescreen state
+
+The helper process has no window, so its widescreen aspect and reveal
+margin were 4:3's: the emitted psx_ws_* cull hooks dropped the geometry in
+the widescreen margins of every helper picture (black wedges at both screen
+edges in every other frame at 60 fps). Each job now carries the main
+process's margin, aspect, squash factor and mode (gpu_ws_pass_state_get/
+set). Checked in a 16:9 window: helper pictures' edges now match the game's
+own frames (right 10%: 6% black -> 2%, the same as the real frame).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ runtime/include/gpu.h     | 14 ++++++++++++++
+ runtime/src/gpu.c         | 15 +++++++++++++++
+ runtime/src/pass_worker.c |  8 ++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/runtime/include/gpu.h b/runtime/include/gpu.h
+index 01d2b26f..932007f0 100644
+--- a/runtime/include/gpu.h
++++ b/runtime/include/gpu.h
+@@ -701,6 +701,20 @@ int gpu_ws_get_aspect_cone_site_debug(
+  * or -1 to restore the normal computed margin. For live cull-margin sweeps. */
+ void gpu_ws_set_margin_override(int v);
+ 
++/* The widescreen state guest code reads through the emitted cull/projection
++ * hooks (psx_ws_*), for a render-pass worker process: it has no window, so
++ * its own aspect and reveal margin are not the game's. get takes the live
++ * values; set makes them this process's until set again (margin < 0 restores
++ * the computed margin). */
++typedef struct GpuWsPassState {
++    int32_t margin;                 /* psx_ws_x_margin() */
++    int32_t cfg_num, cfg_den;       /* configured aspect */
++    int32_t xnum, xden;             /* squash factor */
++    int32_t mode;                   /* 0 off, 1 squash, 2 native-wide */
++} GpuWsPassState;
++void gpu_ws_pass_state_get(GpuWsPassState* out);
++void gpu_ws_pass_state_set(const GpuWsPassState* in);
++
+ /* Native-wide HUD corner re-anchoring: allow TAGGED rect-family prims to
+  * shift too (live A/B via TCP ws_hud_mode; some HUD composites render
+  * through the tagged sprite funnel). */
+diff --git a/runtime/src/gpu.c b/runtime/src/gpu.c
+index 268a734b..ccc896f5 100644
+--- a/runtime/src/gpu.c
++++ b/runtime/src/gpu.c
+@@ -742,6 +742,21 @@ static int ws_margin_override = -1;
+ static int ws_cull_guard_pixels = 0;
+ static int ws_activation_guard_pixels = 0;
+ void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
++int psx_ws_x_margin(void);
++void gpu_ws_pass_state_get(GpuWsPassState *out) {
++    if (!out) return;
++    out->margin = psx_ws_x_margin();
++    out->cfg_num = ws_cfg_num; out->cfg_den = ws_cfg_den;
++    out->xnum = ws_xnum; out->xden = ws_xden;
++    out->mode = ws_mode;
++}
++void gpu_ws_pass_state_set(const GpuWsPassState *in) {
++    if (!in) { ws_margin_override = -1; return; }
++    ws_margin_override = in->margin;
++    if (in->cfg_num > 0 && in->cfg_den > 0) { ws_cfg_num = in->cfg_num; ws_cfg_den = in->cfg_den; }
++    if (in->xnum > 0 && in->xden > 0) { ws_xnum = in->xnum; ws_xden = in->xden; }
++    ws_mode = in->mode;
++}
+ void gpu_ws_set_cull_guard_pixels(int pixels) {
+     if (pixels < 0) pixels = 0;
+     if (pixels > 256) pixels = 256;
+diff --git a/runtime/src/pass_worker.c b/runtime/src/pass_worker.c
+index 67f0e539..505113c7 100644
+--- a/runtime/src/pass_worker.c
++++ b/runtime/src/pass_worker.c
+@@ -22,6 +22,7 @@
+ #include "psx_cycle_freeze.h"
+ #include "psx_cycles.h"
+ #include "psx_video_timing.h"
++#include "gpu.h"
+ 
+ #include <setjmp.h>
+ #include <stdint.h>
+@@ -64,6 +65,7 @@ typedef struct PwShm {
+     uint8_t  ram[PW_RAM_BYTES];
+     uint8_t  spad[PW_SPAD_BYTES];
+     uint32_t dirty_n, dirty[PW_DIRTY_WORDS];   /* code-tracking bitmap */
++    GpuWsPassState ws;            /* the game's widescreen state (no window here) */
+     /* result */
+     uint32_t npages;
+     uint16_t page_idx[PW_MAX_PAGES];
+@@ -270,6 +272,7 @@ int psx_mod_pass_worker_submit(uint32_t slot, const PSXModPassWorkerState *st,
+     shm->lo = st->lo;
+     memcpy(shm->gte_data, st->gte_data, sizeof shm->gte_data);
+     memcpy(shm->gte_ctrl, st->gte_ctrl, sizeof shm->gte_ctrl);
++    gpu_ws_pass_state_get(&shm->ws);
+     shm->user_len = len;
+     if (len) memcpy(shm->user, user, len);
+     shm->ok = 0;
+@@ -363,6 +366,11 @@ static void helper_job(struct CPUState *cpu) {
+     dirty_ram_set_bitmap_words(s_shm->dirty, s_shm->dirty_n);
+     overlay_watch_invalidate_after_ram_restore();
+     memcpy(memory_get_scratchpad_ptr(), s_shm->spad, PW_SPAD_BYTES);
++    /* The helper has no window: its own widescreen aspect and reveal margin
++     * are 4:3's, so the game's culling (emitted psx_ws_* hooks) dropped
++     * everything in the margins of every helper picture (black wedges at the
++     * screen edges in every other frame). Take the game's. */
++    gpu_ws_pass_state_set(&s_shm->ws);
+     memcpy(cpu->gpr, s_shm->gpr, sizeof s_shm->gpr);
+     cpu->hi = s_shm->hi;
+     cpu->lo = s_shm->lo;
+-- 
+2.55.0.windows.5
+
